@@ -296,6 +296,7 @@ class g_list_proto {
 
 var g_list = new g_list_proto();
 
+
 /** g_user is a global object used in client-side scripts, to get current user information */
 class g_user_proto {
     /** Returns true if the current user has at least one of the specified roles in the comma-separated list or the admin role */

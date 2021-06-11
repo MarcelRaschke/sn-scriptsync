@@ -14,10 +14,9 @@ let expressListen;
 
 let sass = require('sass');
 let scriptFields;
-let watchFileSystem = true;
 
 const nodePath = require('path');
-const fs = require('fs'); 
+//const fs = require('fs'); 
 
 let wss;
 let serverRunning = false;
@@ -60,13 +59,19 @@ export function activate(context: vscode.ExtensionContext) {
 
 	updateScriptSyncStatusBarItem('click to start.');
 
-	const settings = vscode.workspace.getConfiguration('sn-scriptsync');
+	let settings = vscode.workspace.getConfiguration('sn-scriptsync');
 	let syncDir: string = settings.get('path');
 	let refresh: number = settings.get('refresh');
-	watchFileSystem = settings.get('watchFileSystem');
 	refresh = Math.max(refresh, 30);
-	syncDir = syncDir.replace('~', userInfo().homedir);
-	if (vscode.workspace.rootPath == syncDir) {
+	syncDir = syncDir.replace('~', '');	
+	if (nodePath.sep == "\\"){ //reverse slash when windows.
+		syncDir = syncDir.replace(/\//g,'\\');
+	}
+	
+	if (typeof workspace.rootPath == 'undefined') {
+		//
+	}
+	else if (vscode.workspace.rootPath.endsWith(syncDir)) {
 		startServers();
 	}
 
@@ -113,10 +118,7 @@ export function activate(context: vscode.ExtensionContext) {
 		selectionToBG();
 	});
 
-	vscode.commands.registerCommand('extension.toggleWatchFileSystem', () => {
-		watchFileSystem = !watchFileSystem;
-		settings.update('watchFileSystem',watchFileSystem);
-	});
+
 
 	vscode.workspace.onDidCloseTextDocument(listener => {
 		delete openFiles[listener.fileName];
@@ -125,12 +127,13 @@ export function activate(context: vscode.ExtensionContext) {
 
 	vscode.workspace.onDidSaveTextDocument(listener => {
 		if (!saveFieldsToServiceNow(listener, true)) {
-			markFileAsDirty(listener)
+			if (listener.fileName.includes("^"))//only sn files
+				markFileAsDirty(listener);
 		}
 	});
 
 	vscode.workspace.onDidChangeConfiguration(event => {
-		watchFileSystem = settings.get('watchFileSystem');
+		settings = vscode.workspace.getConfiguration('sn-scriptsync');
     })
 
 	vscode.workspace.onDidChangeTextDocument(listener => {
@@ -142,7 +145,7 @@ export function activate(context: vscode.ExtensionContext) {
 			}
 			var scriptObj = <any>{};
 			scriptObj.liveupdate = true;
-			var filePath = listener.document.fileName.substring(0, listener.document.fileName.lastIndexOf("/"));
+			var filePath = listener.document.fileName.substring(0, listener.document.fileName.lastIndexOf(nodePath.sep));
 			scriptObj.sys_id = eu.getFileAsJson(filePath + nodePath.sep + "widget.json")['sys_id'];
 			var scss = ".v" + scriptObj.sys_id + " { " + listener.document.getText() + " }";
 			var cssObj = sass.renderSync({
@@ -218,15 +221,6 @@ function startServers() {
 		return;
 	}
 
-	fs.watch(workspace.rootPath, { recursive: true }, (eventType, filename) => { 
-		if (eventType == 'change' && serverRunning && watchFileSystem){
-			if ((Math.floor(+new Date() / 1000) - lastSave) > 3){
-				vscode.workspace.openTextDocument(workspace.rootPath + nodePath.sep +filename).then(
-					document => {saveFieldsToServiceNow(document, false)});
-			}
-		}
-	}); 
-
 
 	let sourceDir = path.join(__filename, '..', '..', 'autocomplete') + nodePath.sep;
 	let targetDir = path.join(workspace.rootPath, 'autocomplete') + nodePath.sep;
@@ -244,15 +238,22 @@ function startServers() {
 		res.end('Please post data for sn-scriptsync to this endpoint');
 	});
 	app.post('/', function (req, res) {
+
+		lastSave = Math.floor(+new Date() / 1000); //prevent immediate postback of saved file
+
 		var postedJson = JSON.parse(req.body);
 		eu.writeInstanceSettings(postedJson.instance);
-		if (postedJson.action == 'saveFieldAsFile' || !postedJson.action)
+		if (postedJson.action == 'saveFieldAsFile')
 			saveFieldAsFile(postedJson);
 		else if (postedJson.action == 'saveWidget')
 			saveWidget(postedJson);
 		else if (postedJson.action == 'linkAppToVSCode')
 			linkAppToVSCode(postedJson);
+		else 
+			refreshedToken(postedJson);
+		
 		//requestRecord(postedJson,wss);
+
 
 		res.setHeader("Access-Control-Allow-Origin", "*");
 		res.setHeader('Access-Control-Allow-Methods', 'POST');
@@ -329,8 +330,9 @@ function stopServers() {
 
 function saveWidget(postedJson) {
 	//lastsend = 0;
+	var cleanName = postedJson.name.replace(/[^a-z0-9 \.\-+]+/gi, '').replace(/\./g, '-').replace(/\s\s+/g, '_');
 	var filePath = workspace.rootPath + nodePath.sep + postedJson.instance.name + nodePath.sep +
-		postedJson.tableName + nodePath.sep + postedJson.name + nodePath.sep;
+		postedJson.tableName + nodePath.sep + cleanName + nodePath.sep;
 
 	var files = {};
 
@@ -445,6 +447,17 @@ function linkAppToVSCode(postedJson) {
 	});
 }
 
+function refreshedToken(postedJson) {
+	postedJson.refreshedtoken = true;
+	postedJson.response = "Refreshed token in VS Code via /token slashcommand. Instance: " + postedJson.instance.name;
+	wss.clients.forEach(function each(client) {
+		if (client.readyState === WebSocket.OPEN && !postedJson.send) {
+			client.send(JSON.stringify(postedJson));
+			postedJson.send = true;
+		}
+	});
+}
+
 
 
 function requestRecords(requestJson) {
@@ -466,14 +479,14 @@ function requestRecords(requestJson) {
 }
 
 function saveFieldsToServiceNow(fileName, fromVsCode:boolean): boolean {
-	if (!serverRunning) return;
+	if (!serverRunning || (!fileName.fileName.includes("^") && !fileName.fileName.includes("sp_widget"))  ) return;
 
 	if (fromVsCode) lastSave = Math.floor(+new Date() / 1000);
 
 	let success: boolean = true;
 	try {
 		let scriptObj = eu.fileNameToObject(fileName);
-
+		scriptObj.saveSource = (fromVsCode) ? "VS Code" : "FileWatcher";
 		if(scriptObj.tableName == 'background') return true; // do not save bg scripts to SN.
 
 		if (!wss.clients.size) {
@@ -609,7 +622,7 @@ async function selectionToBG() {
 	const text = 
 
 	scriptObj.content = '// sn-scriptsync - Snippet received from: (delete file after usage.)\n// file://' + scriptObj.fileName + "\n\n" 
-						 + editor.document.getText(editor.selection);;
+						 + String.raw`${editor.document.getText(editor.selection)}`;;
 	scriptObj.field = 'bg';
 	scriptObj.table = 'background'
 	scriptObj.sys_id = my_id;

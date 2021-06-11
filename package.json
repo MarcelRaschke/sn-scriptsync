@@ -2,10 +2,10 @@
 	"name": "sn-scriptsync",
 	"displayName": "sn-scriptsync",
 	"description": "ServiceNow ScriptSync for VS Code. (Personal work of Arnoud Kooi)",
-	"version": "1.9.1",
+	"version": "2.0.2",
 	"license": "MIT",
 	"publisher": "arnoudkooicom",
-	"icon": "img/icon128.png",
+	"icon": "img/icon256.png",
 	"repository": {
 		"type": "git",
 		"url": "https://github.com/arnoudkooi/sn-scriptsync"
@@ -47,10 +47,6 @@
 				"title": "sn-scriptsync: Open Scope Files Selection"
 			},
 			{
-				"command": "extension.toggleWatchFileSystem",
-				"title": "sn-scriptsync: Toggle FileSystem watcher on/off"
-			},
-			{
 				"command": "extension.bgScriptMirror",
 				"title": "sn-scriptsync: Selection to Background Script Mirror",
 				"when": "editorLangId == javascript"
@@ -74,11 +70,6 @@
 					"default": "~/Documents/sn-scriptsync",
 					"description": "Scripts folder (Extension will auto activate when opening this folder)"
 				},
-				"sn-scriptsync.watchFileSystem": {
-					"type": "boolean",
-					"default": true,
-					"description": "Watch the filesystem for changes outside VS Code"
-				},				
 				"sn-scriptsync.refresh": {
 					"type": "integer",
 					"default": "60",
@@ -111,16 +102,16 @@
 	},
 	"devDependencies": {
 		"@types/node": "^8.10.66",
-		"diff": ">=3.5.0",
+		"diff": "^5.0.0",
 		"tslint": "^5.20.1",
-		"typescript": "^3.0.0",
+		"typescript": "^3.9.9",
 		"vscode": "^1.1.37"
 	},
 	"dependencies": {
 		"body-parser": "^1.19.0",
 		"express": "^4.17.1",
 		"mkdirp": "^0.5.1",
-		"sass": "^1.28.0",
-		"ws": "^6.2.1"
+		"sass": "^1.34.0",
+		"ws": "^7.4.6"
 	}
 }
