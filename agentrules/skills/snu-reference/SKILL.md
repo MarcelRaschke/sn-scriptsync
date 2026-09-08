@@ -3,7 +3,7 @@ name: snu-reference
 description: Extended reference appendix: detailed file-structure notes, table metadata caching, agent best-practices, and edge cases not covered by the core. Read this when you need depth the other skills do not cover.
 ---
 
-<!-- SN-SCRIPTSYNC:SKILL instructionsSchemaVersion=23 -->
+<!-- SN-SCRIPTSYNC:SKILL instructionsSchemaVersion=24 -->
 
 # SN ScriptSync — Deep Reference
 
@@ -579,8 +579,8 @@ The `selector` trick returns a clean, component-only image (no full page, no per
 ### Error Handling
 
 **Errors are automatically:**
-1. Written to `{instance}/_last_error.json`
-2. Used to fail any pending Agent API requests
+1. Written to `{instance}/_last_error.json` for the instance that reported the error only
+2. Used to fail that instance's pending Agent API requests
 3. Available via `get_last_error` command
 
 **Common errors and solutions:**

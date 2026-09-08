@@ -182,6 +182,42 @@ export const TOOLS: ToolDefinition[] = [
     }),
   },
 
+  // 5b. Pull Scope
+  {
+    name: 'snu_pull_scope',
+    agentCommand: 'pull_scope',
+    description:
+      'Pull every scriptable artifact of one application scope into canonical local workspace files (paged past the Table API limits, refreshable). Use pull_records for global or ad-hoc selections.',
+    cliCommand: 'pull-scope',
+    cliUsage: 'snu pull-scope <scope> [--tables <t1,t2>] [--limit <n>] [--instance <i>] [--json]',
+    cliOptions: {
+      tables: { type: 'string', short: 't', description: 'Comma-separated table filter' },
+      limit: { type: 'string', short: 'l', description: 'Max records per table (default: 2000)' },
+    },
+    inputSchema: {
+      type: 'object',
+      properties: {
+        scope: { type: 'string', description: 'Application scope name (x_acme_app) or sys_scope sys_id. "global" is refused.' },
+        tables: { type: 'string', description: 'Comma-separated table filter (optional)' },
+        limit: { type: 'integer', minimum: 1, maximum: 10000, default: 2000, description: 'Max records per table' },
+        includeRecords: { type: 'boolean', default: false, description: 'Return the per-record file list for each table' },
+        instance: { type: 'string', description: 'Target instance name/folder (optional)' },
+      },
+      required: ['scope'],
+      additionalProperties: false,
+    },
+    mapInput: (input) => ({
+      command: 'pull_scope',
+      instance: input.instance,
+      params: {
+        scope: input.scope,
+        tables: typeof input.tables === 'string' ? input.tables.split(',').map((s: string) => s.trim()).filter(Boolean) : (Array.isArray(input.tables) ? input.tables : undefined),
+        limit: typeof input.limit === 'number' ? input.limit : input.limit ? parseInt(input.limit, 10) : undefined,
+        includeRecords: input.includeRecords === true || input['include-records'] === true,
+      },
+    }),
+  },
+
   // 6. Get Record
   {
     name: 'snu_get_record',

@@ -4,8 +4,8 @@ import { TOOLS, getToolByName, getToolByCliCommand } from '../registry.js';
 import { formatHumanOutput } from '../cli/format.js';
 import { resolveContextSecurity } from '../client.js';
 
-test('Registry: exactly 18 tools registered', () => {
-  assert.strictEqual(TOOLS.length, 18);
+test('Registry: exactly 19 tools registered', () => {
+  assert.strictEqual(TOOLS.length, 19);
   const toolNames = TOOLS.map((t) => t.name);
   assert.deepStrictEqual(toolNames, [
     'snu_code_search',
@@ -13,6 +13,7 @@ test('Registry: exactly 18 tools registered', () => {
     'snu_get_context',
     'snu_query_records',
     'snu_pull_records',
+    'snu_pull_scope',
     'snu_get_record',
     'snu_create_artifact',
     'snu_update_record',

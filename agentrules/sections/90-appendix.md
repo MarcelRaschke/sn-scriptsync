@@ -568,8 +568,8 @@ The `selector` trick returns a clean, component-only image (no full page, no per
 ### Error Handling
 
 **Errors are automatically:**
-1. Written to `{instance}/_last_error.json`
-2. Used to fail any pending Agent API requests
+1. Written to `{instance}/_last_error.json` for the instance that reported the error only
+2. Used to fail that instance's pending Agent API requests
 3. Available via `get_last_error` command
 
 **Common errors and solutions:**

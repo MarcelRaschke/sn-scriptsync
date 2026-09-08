@@ -22,7 +22,9 @@ import { resolveBridgeOwnership, PortDescriptor } from './bridgeOwnership';
 // structured userFeedback and E_USER_REJECTED.
 // v8 -> v9: added pull_records (and pull_artifacts alias) for bulk and single
 // artifact pulling to canonical local workspace files with _map.json sync.
-export const AGENT_API_VERSION = 9;
+// v9 -> v10: added pull_scope: every scriptable artifact of one application
+// scope to canonical local files, paged past the Table API limits.
+export const AGENT_API_VERSION = 10;
 
 /** Preferred fixed port for the Agent API. If it's taken the server falls back
  * to an ephemeral port — the port files below always carry the actual port. */

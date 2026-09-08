@@ -9,7 +9,7 @@ function slugify(name: string): string {
 }
 
 /** Persist a scope name -> sys_id mapping so create_artifact/add_column can resolve it. */
-function rememberScope(instanceFolder: string, scopeName: string, scopeSysId: string, log: (m: string) => void) {
+export function rememberScope(instanceFolder: string, scopeName: string, scopeSysId: string, log: (m: string) => void) {
 	if (!scopeName || !scopeSysId) return;
 	const scopesPath = path.join(instanceFolder, 'scopes.json');
 	try {
@@ -21,7 +21,7 @@ function rememberScope(instanceFolder: string, scopeName: string, scopeSysId: st
 	} catch { /* best-effort */ }
 }
 
-function resolveScopeSysId(instanceFolder: string, scopeName?: string): string | undefined {
+export function resolveScopeSysId(instanceFolder: string, scopeName?: string): string | undefined {
 	if (!scopeName || scopeName === 'global') return undefined;
 	const scopesPath = path.join(instanceFolder, 'scopes.json');
 	if (fs.existsSync(scopesPath)) {

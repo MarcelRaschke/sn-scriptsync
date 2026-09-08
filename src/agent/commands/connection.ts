@@ -219,6 +219,7 @@ const get_last_error: CommandHandler = {
 				time: data.time,
 				timestamp: data.timestamp,
 				details: data.details,
+				instance: data.instance || undefined,
 			};
 		} catch {
 			return { hasError: false, message: 'No recent errors' };

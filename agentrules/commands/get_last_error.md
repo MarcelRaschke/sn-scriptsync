@@ -1,5 +1,5 @@
 ### `get_last_error`
-Get the last error that occurred. Errors are automatically written to `_last_error.json` and pending Agent requests are failed when ServiceNow returns an error.
+Get the last error that occurred. Errors are automatically written to `_last_error.json` in the folder of the instance that reported them, and that instance's pending Agent requests are failed when ServiceNow returns an error. Other instance folders in the workspace are untouched.
 
 **Request:**
 ```json
@@ -15,7 +15,8 @@ Get the last error that occurred. Errors are automatically written to `_last_err
     "error": "ACL Error, try changing scope in the browser",
     "time": "2024-12-07T12:30:45.123Z",
     "timestamp": 1733567445123,
-    "details": { "message": "...", "detail": "..." }
+    "details": { "message": "...", "detail": "..." },
+    "instance": { "name": "dev221527", "url": "https://dev221527.service-now.com" }
   }
 }
 ```
