@@ -54,3 +54,23 @@ test('an omitted boolean flag stays undefined rather than becoming a string', ()
   assert.strictEqual(parsed.values['no-suppress-dialogs'], undefined);
   assert.deepStrictEqual(parsed.positionals, ['save']);
 });
+
+test('E_INSTANCE_REQUIRED is rephrased for the --instance flag on the CLI', async () => {
+  const { cliInstanceRequiredMessage } = await import('../cli/format.js');
+  const err = Object.assign(
+    new Error('Multiple known workspace instances found (dev382144, ven08329); this does not mean they have live helper sessions. Pass "instance": "<name>" in the request.'),
+    { code: 'E_INSTANCE_REQUIRED', details: { knownInstances: ['dev382144', 'ven08329'], connectedInstances: [] } }
+  );
+  const msg = cliInstanceRequiredMessage(err, ['query', 'incident', '--json']);
+  assert.ok(!msg.includes('in the request'), 'API phrasing must not leak to the terminal');
+  assert.ok(msg.includes('--instance'), 'must name the CLI flag');
+  assert.ok(msg.includes('snu -i dev382144 query incident'), `must show a runnable example, got: ${msg}`);
+  assert.ok(msg.includes('does not mean its helper tab is open'));
+
+  const live = Object.assign(new Error('Multiple helper-connected instances found (a, b). Pass "instance": "<name>" in the request.'), {
+    code: 'E_INSTANCE_REQUIRED', details: { knownInstances: ['a', 'b', 'c'], connectedInstances: ['a', 'b'] },
+  });
+  const liveMsg = cliInstanceRequiredMessage(live, ['record', 'get', 'incident']);
+  assert.ok(liveMsg.startsWith('Several instances have a live helper session (a, b).'));
+  assert.ok(liveMsg.includes('snu -i a record get'));
+});
