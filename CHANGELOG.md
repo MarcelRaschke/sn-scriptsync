@@ -1,6 +1,6 @@
 # CHANGELOG.md
 
-## 4.9.3 (unreleased)
+## 4.9.3 (2026-09-08)
 
 **Pull a whole application to disk in one call, and Load Scope no longer stops at 100 records per table (`@snutils/snu` 0.2.10).**
 
