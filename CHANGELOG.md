@@ -7,6 +7,7 @@
 - **New `pull_scope` command (SNU0000010158).** One call pulls every scriptable artifact of an application scope into the canonical `<instance>/<scope>/<table>` layout with `_map.json` tracking, so an agent works from local files instead of fetching artifacts one by one. It discovers which tables the application uses, pages each one past the Table API limits, reports per-table counts and the tables it skipped, and can be re-run to refresh. Available on both hosts and in the CLI as `snu pull-scope <scope>`; MCP tool `snu_pull_scope`. Transport API v10, instructions schema v24.
 - **Fixed: Load Scope silently stopped at 100 records per table.** The VS Code Load Scope button now pages through every table and the completion message reports how many records and tables were loaded.
 - **Fixed: `snu pull <table>` never sent the table.** The CLI had no positional mapping for `pull`, so the documented `snu pull sys_script "query"` failed with `E_INVALID_PARAMS`. It now maps the table and query, and both `pull` and `pull-scope` are listed in `snu --help`.
+- **Fixed: the CLI repeated the API wording when several instances matched.** `E_INSTANCE_REQUIRED` told you to pass `"instance"` in the request, which is the HTTP contract, not the terminal; `snu` now says which instances are known or live and shows the runnable form, e.g. `snu -i ven08329 query incident`. A bare `instance:<name>` positional was never a flag and was sent as the query.
 
 **An error on one instance no longer fails every instance in the workspace.**
 

@@ -294,10 +294,32 @@ export function outputJson(data: any): void {
 /**
  * Output structured error on stderr.
  */
+// The bridge phrases E_INSTANCE_REQUIRED for API callers ("Pass "instance":
+// "<name>" in the request"). On the CLI the answer is the --instance flag, and
+// a bare "instance:<name>" positional would be sent as the query, so rewrite the
+// hint before it reaches the terminal.
+export function cliInstanceRequiredMessage(err: any, argv: string[] = process.argv.slice(2)): string {
+  const raw = String(err?.message || err || '');
+  const connected: string[] = Array.isArray(err?.details?.connectedInstances) ? err.details.connectedInstances : [];
+  const known: string[] = Array.isArray(err?.details?.knownInstances) ? err.details.knownInstances : [];
+  const pool = connected.length ? connected : known;
+  const example = pool[0] || '<name>';
+  const command = argv.filter((a) => a !== '-j' && a !== '--json').slice(0, 2).join(' ') || 'query incident';
+  const lead = connected.length
+    ? `Several instances have a live helper session (${connected.join(', ')}).`
+    : known.length
+      ? `Several workspace instances are known (${known.join(', ')}); a listed name does not mean its helper tab is open.`
+      : raw.replace(/\s*Pass "instance": "<name>" in the request\.?$/, '');
+  return `${lead} Choose one with --instance, e.g. snu -i ${example} ${command}`;
+}
+
 export function outputError(err: any, isJsonMode = false): void {
+  const message = err?.code === 'E_INSTANCE_REQUIRED' && /Pass "instance"/.test(String(err?.message || ''))
+    ? cliInstanceRequiredMessage(err)
+    : (err?.message || String(err));
   const errorObj = {
     status: 'error',
-    error: err?.message || String(err),
+    error: message,
     code: err?.code || 'E_COMMAND_FAILED',
     status_code: err?.status || null,
     details: err?.details || null,
@@ -323,7 +345,7 @@ export function outputError(err: any, isJsonMode = false): void {
       );
     } else {
       process.stderr.write(
-        `\n${ANSI.red}${ANSI.bold}Error:${ANSI.reset} ${err?.message || err}\n` +
+        `\n${ANSI.red}${ANSI.bold}Error:${ANSI.reset} ${message}\n` +
         (err?.code ? `${ANSI.gray}Code: ${err.code}${ANSI.reset}\n` : '')
       );
     }
