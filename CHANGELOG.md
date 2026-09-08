@@ -1,5 +1,17 @@
 # CHANGELOG.md
 
+## 4.9.3 (unreleased)
+
+**Pull a whole application to disk in one call, and Load Scope no longer stops at 100 records per table (`@snutils/snu` 0.2.10).**
+
+- **New `pull_scope` command (SNU0000010158).** One call pulls every scriptable artifact of an application scope into the canonical `<instance>/<scope>/<table>` layout with `_map.json` tracking, so an agent works from local files instead of fetching artifacts one by one. It discovers which tables the application uses, pages each one past the Table API limits, reports per-table counts and the tables it skipped, and can be re-run to refresh. Available on both hosts and in the CLI as `snu pull-scope <scope>`; MCP tool `snu_pull_scope`. Transport API v10, instructions schema v24.
+- **Fixed: Load Scope silently stopped at 100 records per table.** The VS Code Load Scope button now pages through every table and the completion message reports how many records and tables were loaded.
+- **Fixed: `snu pull <table>` never sent the table.** The CLI had no positional mapping for `pull`, so the documented `snu pull sys_script "query"` failed with `E_INVALID_PARAMS`. It now maps the table and query, and both `pull` and `pull-scope` are listed in `snu --help`.
+
+**An error on one instance no longer fails every instance in the workspace.**
+
+- **Fixed: a helper-tab error on one instance was relayed to every instance folder (#159).** A ServiceNow error reported through the helper tab (a rejected synced-file save, for example) wrote the same `_last_error.json` into every instance folder in the workspace and rejected every pending Agent API call, so a failure on `dev` surfaced as a failure on `test` and `prod` too. The helper tab now tags each error with the instance it came from, and the extension writes the error file and fails pending calls for that folder only; `get_last_error` also returns which instance the error belongs to. Requires SN Utils 10.2.2.5 or later in the browser; an older helper tab keeps the previous every-folder behaviour so no error is lost.
+
 ## 4.9.2 (2026-09-04)
 
 **The newest helper tab always wins the bridge, and a `/token` refresh is confirmed when the snu daemon owns it (`@snutils/snu` 0.2.9).**

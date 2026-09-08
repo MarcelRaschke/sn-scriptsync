@@ -7,6 +7,7 @@ import { ExtensionUtils } from '../../ExtensionUtils';
 import { Constants } from '../../constants';
 import { safeJoinUnderRoot, sanitizePathComponent } from '../../pathSafety';
 import { mustGetInstanceSettings, getSetting, restRequest, readBackRecord } from './_shared';
+import { rememberScope, resolveScopeSysId } from './scopedapp';
 import {
 	resolveCreateScope,
 	applyScopeToFields,
@@ -698,6 +699,217 @@ function resolveFieldExtension(tableName: string, fieldName: string): string {
 	return ext;
 }
 
+export interface PullTableOptions {
+	table: string;
+	/** Encoded query (already combined with any sys_id selection). */
+	query: string;
+	codeFields: string[];
+	limit: number;
+	offset?: number;
+	openFiles?: boolean;
+}
+
+export interface PullTableResult {
+	table: string;
+	matchedRecords: number;
+	pulledRecords: number;
+	filesWritten: number;
+	skippedEmpty: number;
+	warnings: string[];
+	records: Array<{
+		sys_id: string;
+		name: string;
+		scope: string;
+		files: Array<{ field: string; path: string; bytes: number; action: 'created' | 'updated' | 'cleared' | 'skipped_empty' }>;
+	}>;
+}
+
+/**
+ * Pull one page of one table into canonical workspace files. Shared by
+ * pull_records (a single page the caller sized) and pull_scope (which walks
+ * every code table of an application page by page).
+ */
+async function pullTableToFiles(ctx: any, instanceSettings: any, instanceName: string, opts: PullTableOptions): Promise<PullTableResult> {
+	const { table, codeFields, limit, openFiles } = opts;
+	const combinedQuery = opts.query;
+	const offset = opts.offset || 0;
+
+	const displayFields = ['sys_id', 'name', 'sys_name', 'short_description', 'sys_scope', 'sys_scope.scope'];
+	const allRequestedFields = Array.from(new Set([...displayFields, ...codeFields])).join(',');
+
+	const queryParams: Record<string, string> = {
+		sysparm_fields: allRequestedFields,
+		sysparm_limit: String(limit),
+		sysparm_offset: String(offset),
+		sysparm_display_value: 'false',
+		sysparm_exclude_reference_link: 'true',
+		sysparm_no_count: 'true',
+	};
+	if (combinedQuery) {
+		queryParams.sysparm_query = combinedQuery;
+	}
+
+	const { data } = await restRequest(ctx, instanceSettings, {
+		endpoint: `/api/now/table/${table}`,
+		method: 'GET',
+		queryParams,
+	});
+
+	const matchedRecords: any[] = Array.isArray(data?.result) ? data.result : (data?.result ? [data.result] : []);
+	const isFolderRecordTable = Constants.FOLDERRECORDTABLES.includes(table);
+
+	let filesWritten = 0;
+	let skippedEmpty = 0;
+	const warnings: string[] = [];
+	const pulledRecordsList: Array<{
+		sys_id: string;
+		name: string;
+		scope: string;
+		files: Array<{ field: string; path: string; bytes: number; action: 'created' | 'updated' | 'cleared' | 'skipped_empty' }>;
+	}> = [];
+
+	for (const rec of matchedRecords) {
+		const sysId = typeof rec.sys_id === 'object' ? rec.sys_id.value : String(rec.sys_id || '');
+		if (!sysId) continue;
+
+		// Scope resolution
+		let scope = 'global';
+		if (rec['sys_scope.scope']) {
+			scope = String(rec['sys_scope.scope']);
+		} else if (rec.sys_scope) {
+			scope = typeof rec.sys_scope === 'object' ? String(rec.sys_scope.value || rec.sys_scope.display_value || 'global') : String(rec.sys_scope);
+		}
+		if (!scope || scope === 'null' || scope === 'undefined') scope = 'global';
+
+		const rawName = rec.name || rec.sys_name || rec.short_description || sysId;
+		const name = String(rawName).trim();
+
+		// Read / update _map.json
+		let mapPath: string;
+		try {
+			mapPath = safeJoinUnderRoot(ctx.workspaceRoot, instanceName, scope, table, '_map.json');
+		} catch (e: any) {
+			warnings.push(`Could not resolve map path for ${scope}/${table}: ${e?.message || e}`);
+			continue;
+		}
+
+		let nameToSysId: Record<string, string> = {};
+		if (fs.existsSync(mapPath)) {
+			try { nameToSysId = JSON.parse(fs.readFileSync(mapPath, 'utf8')) || {}; } catch {}
+		}
+
+		let cleanName = name.replace(/[^a-z0-9._\-+]+/gi, '').replace(/\./g, '-') || sysId;
+		const existingKey = Object.keys(nameToSysId).find((k) => nameToSysId[k] === sysId);
+		if (existingKey) {
+			cleanName = existingKey;
+		} else if (nameToSysId[cleanName] && nameToSysId[cleanName] !== sysId) {
+			cleanName = `${cleanName}-${sysId.slice(0, 2)}${sysId.slice(-2)}`.toUpperCase();
+		}
+		nameToSysId[cleanName] = sysId;
+
+		// Write _map.json
+		try {
+			ExtensionUtils.markSelfWrite(mapPath);
+			await fs.promises.mkdir(path.dirname(mapPath), { recursive: true });
+			await fs.promises.writeFile(mapPath, JSON.stringify(nameToSysId, null, 4), 'utf8');
+		} catch (e: any) {
+			warnings.push(`Failed to write _map.json at ${mapPath}: ${e?.message || e}`);
+		}
+
+		// Special handling for sp_widget: _test_urls.txt
+		if (table === 'sp_widget') {
+			try {
+				const testUrlsPath = safeJoinUnderRoot(ctx.workspaceRoot, instanceName, scope, table, cleanName, '_test_urls.txt');
+				if (!fs.existsSync(testUrlsPath)) {
+					const dispVal = name.toLowerCase().replace(/\s+/g, '_');
+					const testUrls = [
+						`${instanceSettings.url}/$sp.do?id=sp-preview&sys_id=${sysId}`,
+						`${instanceSettings.url}/sp_config?id=${dispVal}`,
+						`${instanceSettings.url}/sp?id=${dispVal}`,
+						`${instanceSettings.url}/esc?id=${dispVal}`,
+					].join('\n');
+					ExtensionUtils.markSelfWrite(testUrlsPath);
+					await fs.promises.mkdir(path.dirname(testUrlsPath), { recursive: true });
+					await fs.promises.writeFile(testUrlsPath, testUrls, 'utf8');
+				}
+			} catch {}
+		}
+
+		const recordFiles: Array<{ field: string; path: string; bytes: number; action: 'created' | 'updated' | 'cleared' | 'skipped_empty' }> = [];
+
+		for (const field of codeFields) {
+			const ext = resolveFieldExtension(table, field);
+			let targetPath: string;
+			try {
+				targetPath = isFolderRecordTable
+					? safeJoinUnderRoot(ctx.workspaceRoot, instanceName, scope, table, cleanName, `${field}${ext}`)
+					: safeJoinUnderRoot(ctx.workspaceRoot, instanceName, scope, table, `${cleanName}.${field}${ext}`);
+			} catch (e: any) {
+				warnings.push(`Unsafe path for ${scope}/${table}/${cleanName}.${field}: ${e?.message || e}`);
+				continue;
+			}
+
+			const relPath = path.relative(ctx.workspaceRoot, targetPath).replace(/\\/g, '/');
+			const rawVal = rec[field];
+			const content = rawVal !== null && rawVal !== undefined ? String(rawVal) : '';
+			const fileExisted = fs.existsSync(targetPath);
+
+			if (content.length > 0) {
+				try {
+					ExtensionUtils.markSelfWrite(targetPath);
+					await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
+					await fs.promises.writeFile(targetPath, content, 'utf8');
+					filesWritten++;
+					const action = fileExisted ? 'updated' : 'created';
+					recordFiles.push({ field, path: relPath, bytes: Buffer.byteLength(content, 'utf8'), action });
+
+					if (openFiles) {
+						try {
+							const doc = await vscode.workspace.openTextDocument(targetPath);
+							await vscode.window.showTextDocument(doc, { preview: false });
+						} catch {}
+					}
+				} catch (e: any) {
+					warnings.push(`Failed to write ${relPath}: ${e?.message || e}`);
+				}
+			} else if (fileExisted) {
+				// Empty remote field, but local file exists -> clear stale code
+				try {
+					ExtensionUtils.markSelfWrite(targetPath);
+					await fs.promises.writeFile(targetPath, '', 'utf8');
+					filesWritten++;
+					recordFiles.push({ field, path: relPath, bytes: 0, action: 'cleared' });
+				} catch (e: any) {
+					warnings.push(`Failed to clear ${relPath}: ${e?.message || e}`);
+				}
+			} else {
+				// Empty remote field and no local file -> skip
+				skippedEmpty++;
+				recordFiles.push({ field, path: relPath, bytes: 0, action: 'skipped_empty' });
+			}
+		}
+
+		pulledRecordsList.push({
+			sys_id: sysId,
+			name,
+			scope,
+			files: recordFiles,
+		});
+	}
+
+	ctx.log(`Agent API: Pulled ${pulledRecordsList.length}/${matchedRecords.length} record(s) from ${table} (${filesWritten} file(s) written, ${skippedEmpty} skipped empty)`);
+
+	return {
+		table,
+		matchedRecords: matchedRecords.length,
+		pulledRecords: pulledRecordsList.length,
+		filesWritten,
+		skippedEmpty,
+		warnings,
+		records: pulledRecordsList,
+	};
+}
+
 const pull_records: CommandHandler = {
 	name: 'pull_records',
 	requiresBrowser: true,
@@ -770,178 +982,173 @@ const pull_records: CommandHandler = {
 		const instanceSettings = mustGetInstanceSettings(ctx.instanceFolder);
 		const instanceName = path.basename(ctx.instanceFolder);
 
-		const displayFields = ['sys_id', 'name', 'sys_name', 'short_description', 'sys_scope', 'sys_scope.scope'];
-		const allRequestedFields = Array.from(new Set([...displayFields, ...codeFields])).join(',');
+		return pullTableToFiles(ctx, instanceSettings, instanceName, { table, query: combinedQuery, codeFields, limit, openFiles });
+	},
+};
 
-		const queryParams: Record<string, string> = {
-			sysparm_fields: allRequestedFields,
-			sysparm_limit: String(limit),
-			sysparm_display_value: 'false',
-			sysparm_exclude_reference_link: 'true',
-			sysparm_no_count: 'true',
-		};
-		if (combinedQuery) {
-			queryParams.sysparm_query = combinedQuery;
+// Every artifact table sn-scriptsync knows how to write to disk: the tables in
+// resources/metaDataRelations.json that declare code fields. Same list the
+// VS Code "Load Scope" button walks.
+function allCodeTables(): Set<string> {
+	const meta = getMetaDataRelations();
+	const out = new Set<string>();
+	for (const [table, def] of Object.entries<any>(meta?.tableFields || {})) {
+		if (def?.codeFields && typeof def.codeFields === 'object') out.add(table);
+	}
+	return out;
+}
+
+const PULL_SCOPE_PAGE_SIZE = 100;
+const PULL_SCOPE_DEFAULT_LIMIT = 2000;
+const PULL_SCOPE_MAX_LIMIT = 10000;
+
+const pull_scope: CommandHandler = {
+	name: 'pull_scope',
+	requiresBrowser: true,
+	docs: {
+		summary: 'Pull every scriptable artifact of one application scope into canonical local files, paging past the Table API limits.',
+		request: {
+			command: 'pull_scope',
+			id: 'pull_scope_1',
+			params: { scope: 'x_acme_app', tables: ['sys_script_include', 'sys_script'], limit: 2000 },
+		},
+	},
+	async handle(ctx, params) {
+		const rawScope = params?.scope;
+		if (!rawScope || typeof rawScope !== 'string' || !rawScope.trim()) {
+			throw new AgentError('E_INVALID_PARAMS', 'Missing required param "scope" (application scope name such as x_acme_app, or its sys_scope sys_id)');
+		}
+		const scopeParam = rawScope.trim();
+		if (scopeParam === 'global') {
+			throw new AgentError('E_INVALID_PARAMS', 'pull_scope targets one application; the global scope is too large to pull whole. Use pull_records with a query instead.');
+		}
+		if (!/^[A-Za-z0-9_]+$/.test(scopeParam)) {
+			throw new AgentError('E_INVALID_PARAMS', 'Parameter "scope" must be a scope name (letters, digits, underscore) or a 32-character sys_id.');
 		}
 
-		const { data } = await restRequest(ctx, instanceSettings, {
-			endpoint: `/api/now/table/${table}`,
-			method: 'GET',
-			queryParams,
-		});
-
-		const matchedRecords: any[] = Array.isArray(data?.result) ? data.result : (data?.result ? [data.result] : []);
-		const isFolderRecordTable = Constants.FOLDERRECORDTABLES.includes(table);
-
-		let filesWritten = 0;
-		let skippedEmpty = 0;
-		const warnings: string[] = [];
-		const pulledRecordsList: Array<{
-			sys_id: string;
-			name: string;
-			scope: string;
-			files: Array<{ field: string; path: string; bytes: number; action: 'created' | 'updated' | 'cleared' | 'skipped_empty' }>;
-		}> = [];
-
-		for (const rec of matchedRecords) {
-			const sysId = typeof rec.sys_id === 'object' ? rec.sys_id.value : String(rec.sys_id || '');
-			if (!sysId) continue;
-
-			// Scope resolution
-			let scope = 'global';
-			if (rec['sys_scope.scope']) {
-				scope = String(rec['sys_scope.scope']);
-			} else if (rec.sys_scope) {
-				scope = typeof rec.sys_scope === 'object' ? String(rec.sys_scope.value || rec.sys_scope.display_value || 'global') : String(rec.sys_scope);
+		let limit = PULL_SCOPE_DEFAULT_LIMIT;
+		if (params?.limit !== undefined) {
+			if (typeof params.limit !== 'number' || !Number.isInteger(params.limit) || params.limit < 1 || params.limit > PULL_SCOPE_MAX_LIMIT) {
+				throw new AgentError('E_INVALID_PARAMS', `Parameter "limit" must be an integer between 1 and ${PULL_SCOPE_MAX_LIMIT} (records per table).`);
 			}
-			if (!scope || scope === 'null' || scope === 'undefined') scope = 'global';
+			limit = params.limit;
+		}
 
-			const rawName = rec.name || rec.sys_name || rec.short_description || sysId;
-			const name = String(rawName).trim();
-
-			// Read / update _map.json
-			let mapPath: string;
-			try {
-				mapPath = safeJoinUnderRoot(ctx.workspaceRoot, instanceName, scope, table, '_map.json');
-			} catch (e: any) {
-				warnings.push(`Could not resolve map path for ${scope}/${table}: ${e?.message || e}`);
-				continue;
-			}
-
-			let nameToSysId: Record<string, string> = {};
-			if (fs.existsSync(mapPath)) {
-				try { nameToSysId = JSON.parse(fs.readFileSync(mapPath, 'utf8')) || {}; } catch {}
-			}
-
-			let cleanName = name.replace(/[^a-z0-9._\-+]+/gi, '').replace(/\./g, '-') || sysId;
-			const existingKey = Object.keys(nameToSysId).find((k) => nameToSysId[k] === sysId);
-			if (existingKey) {
-				cleanName = existingKey;
-			} else if (nameToSysId[cleanName] && nameToSysId[cleanName] !== sysId) {
-				cleanName = `${cleanName}-${sysId.slice(0, 2)}${sysId.slice(-2)}`.toUpperCase();
-			}
-			nameToSysId[cleanName] = sysId;
-
-			// Write _map.json
-			try {
-				ExtensionUtils.markSelfWrite(mapPath);
-				await fs.promises.mkdir(path.dirname(mapPath), { recursive: true });
-				await fs.promises.writeFile(mapPath, JSON.stringify(nameToSysId, null, 4), 'utf8');
-			} catch (e: any) {
-				warnings.push(`Failed to write _map.json at ${mapPath}: ${e?.message || e}`);
-			}
-
-			// Special handling for sp_widget: _test_urls.txt
-			if (table === 'sp_widget') {
-				try {
-					const testUrlsPath = safeJoinUnderRoot(ctx.workspaceRoot, instanceName, scope, table, cleanName, '_test_urls.txt');
-					if (!fs.existsSync(testUrlsPath)) {
-						const dispVal = name.toLowerCase().replace(/\s+/g, '_');
-						const testUrls = [
-							`${instanceSettings.url}/$sp.do?id=sp-preview&sys_id=${sysId}`,
-							`${instanceSettings.url}/sp_config?id=${dispVal}`,
-							`${instanceSettings.url}/sp?id=${dispVal}`,
-							`${instanceSettings.url}/esc?id=${dispVal}`,
-						].join('\n');
-						ExtensionUtils.markSelfWrite(testUrlsPath);
-						await fs.promises.mkdir(path.dirname(testUrlsPath), { recursive: true });
-						await fs.promises.writeFile(testUrlsPath, testUrls, 'utf8');
-					}
-				} catch {}
-			}
-
-			const recordFiles: Array<{ field: string; path: string; bytes: number; action: 'created' | 'updated' | 'cleared' | 'skipped_empty' }> = [];
-
-			for (const field of codeFields) {
-				const ext = resolveFieldExtension(table, field);
-				let targetPath: string;
-				try {
-					targetPath = isFolderRecordTable
-						? safeJoinUnderRoot(ctx.workspaceRoot, instanceName, scope, table, cleanName, `${field}${ext}`)
-						: safeJoinUnderRoot(ctx.workspaceRoot, instanceName, scope, table, `${cleanName}.${field}${ext}`);
-				} catch (e: any) {
-					warnings.push(`Unsafe path for ${scope}/${table}/${cleanName}.${field}: ${e?.message || e}`);
-					continue;
+		let tableFilter: Set<string> | null = null;
+		if (params?.tables !== undefined) {
+			const raw = Array.isArray(params.tables) ? params.tables : (typeof params.tables === 'string' ? params.tables.split(',') : null);
+			if (!raw) throw new AgentError('E_INVALID_PARAMS', 'Parameter "tables" must be an array of table names.');
+			tableFilter = new Set<string>();
+			for (const t of raw) {
+				if (typeof t !== 'string' || !/^[A-Za-z0-9_]+$/.test(t.trim())) {
+					throw new AgentError('E_INVALID_PARAMS', `Invalid table name in "tables": ${String(t)}`);
 				}
-
-				const relPath = path.relative(ctx.workspaceRoot, targetPath).replace(/\\/g, '/');
-				const rawVal = rec[field];
-				const content = rawVal !== null && rawVal !== undefined ? String(rawVal) : '';
-				const fileExisted = fs.existsSync(targetPath);
-
-				if (content.length > 0) {
-					try {
-						ExtensionUtils.markSelfWrite(targetPath);
-						await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
-						await fs.promises.writeFile(targetPath, content, 'utf8');
-						filesWritten++;
-						const action = fileExisted ? 'updated' : 'created';
-						recordFiles.push({ field, path: relPath, bytes: Buffer.byteLength(content, 'utf8'), action });
-
-						if (openFiles) {
-							try {
-								const doc = await vscode.workspace.openTextDocument(targetPath);
-								await vscode.window.showTextDocument(doc, { preview: false });
-							} catch {}
-						}
-					} catch (e: any) {
-						warnings.push(`Failed to write ${relPath}: ${e?.message || e}`);
-					}
-				} else if (fileExisted) {
-					// Empty remote field, but local file exists -> clear stale code
-					try {
-						ExtensionUtils.markSelfWrite(targetPath);
-						await fs.promises.writeFile(targetPath, '', 'utf8');
-						filesWritten++;
-						recordFiles.push({ field, path: relPath, bytes: 0, action: 'cleared' });
-					} catch (e: any) {
-						warnings.push(`Failed to clear ${relPath}: ${e?.message || e}`);
-					}
-				} else {
-					// Empty remote field and no local file -> skip
-					skippedEmpty++;
-					recordFiles.push({ field, path: relPath, bytes: 0, action: 'skipped_empty' });
-				}
+				tableFilter.add(t.trim());
 			}
+		}
+		const includeRecords = params?.includeRecords === true;
 
-			pulledRecordsList.push({
-				sys_id: sysId,
-				name,
-				scope,
-				files: recordFiles,
+		const instanceSettings = mustGetInstanceSettings(ctx.instanceFolder);
+		const instanceName = path.basename(ctx.instanceFolder);
+
+		// Resolve the scope: sys_id as given, else scopes.json, else the instance.
+		let scopeSysId: string | undefined;
+		let scopeName: string | undefined;
+		if (/^[0-9a-fA-F]{32}$/.test(scopeParam)) {
+			scopeSysId = scopeParam.toLowerCase();
+		} else {
+			scopeName = scopeParam;
+			scopeSysId = resolveScopeSysId(ctx.instanceFolder, scopeName);
+		}
+		if (!scopeSysId || !scopeName) {
+			const lookupQuery = scopeSysId ? `sys_id=${scopeSysId}` : `scope=${scopeName}`;
+			const { data } = await restRequest(ctx, instanceSettings, {
+				endpoint: '/api/now/table/sys_scope',
+				method: 'GET',
+				queryParams: {
+					sysparm_query: lookupQuery,
+					sysparm_fields: 'sys_id,scope,name',
+					sysparm_limit: '1',
+					sysparm_exclude_reference_link: 'true',
+					sysparm_no_count: 'true',
+				},
 			});
+			const row = Array.isArray(data?.result) ? data.result[0] : data?.result;
+			if (!row?.sys_id) {
+				throw new AgentError('E_NOT_FOUND', `Application scope "${scopeParam}" was not found on ${instanceName}.`);
+			}
+			scopeSysId = String(typeof row.sys_id === 'object' ? row.sys_id.value : row.sys_id).toLowerCase();
+			scopeName = String(typeof row.scope === 'object' ? row.scope.value : row.scope);
+			rememberScope(ctx.instanceFolder, scopeName, scopeSysId, ctx.log);
 		}
 
-		ctx.log(`Agent API: Pulled ${pulledRecordsList.length}/${matchedRecords.length} record(s) from ${table} (${filesWritten} file(s) written, ${skippedEmpty} skipped empty)`);
+		// Which artifact tables does this application actually use?
+		const classCounts = new Map<string, number>();
+		const metaPage = 1000;
+		for (let offset = 0; ; offset += metaPage) {
+			const { data } = await restRequest(ctx, instanceSettings, {
+				endpoint: '/api/now/table/sys_metadata',
+				method: 'GET',
+				queryParams: {
+					sysparm_query: `sys_scope=${scopeSysId}^sys_class_name!=sys_metadata_delete^sys_update_name!=NULL^ORDERBYsys_id`,
+					sysparm_fields: 'sys_class_name',
+					sysparm_limit: String(metaPage),
+					sysparm_offset: String(offset),
+					sysparm_exclude_reference_link: 'true',
+					sysparm_no_count: 'true',
+				},
+			});
+			const rows: any[] = Array.isArray(data?.result) ? data.result : [];
+			for (const r of rows) {
+				const cls = String(typeof r.sys_class_name === 'object' ? r.sys_class_name.value : r.sys_class_name || '');
+				if (cls) classCounts.set(cls, (classCounts.get(cls) || 0) + 1);
+			}
+			if (rows.length < metaPage) break;
+		}
+
+		const codeTables = allCodeTables();
+		const tables = [...classCounts.keys()].filter((t) => codeTables.has(t) && (!tableFilter || tableFilter.has(t))).sort();
+		const skippedTables = [...classCounts.keys()].filter((t) => !codeTables.has(t)).sort()
+			.map((t) => ({ table: t, records: classCounts.get(t) || 0 }));
+		const missingTables = tableFilter ? [...tableFilter].filter((t) => !classCounts.has(t)).sort() : [];
+
+		const perTable: Array<{ table: string; matchedRecords: number; pulledRecords: number; filesWritten: number; skippedEmpty: number; truncated: boolean; records?: PullTableResult['records'] }> = [];
+		const warnings: string[] = [];
+		let totalRecords = 0, totalFiles = 0, totalSkippedEmpty = 0;
+
+		for (const table of tables) {
+			const codeFields = resolveTableCodeFields(table);
+			const query = `sys_scope=${scopeSysId}^sys_class_name=${table}^ORDERBYsys_id`;
+			const entry = { table, matchedRecords: 0, pulledRecords: 0, filesWritten: 0, skippedEmpty: 0, truncated: false, records: includeRecords ? [] as PullTableResult['records'] : undefined };
+			for (let offset = 0; ; offset += PULL_SCOPE_PAGE_SIZE) {
+				const pageLimit = Math.min(PULL_SCOPE_PAGE_SIZE, limit - entry.matchedRecords);
+				if (pageLimit <= 0) { entry.truncated = true; break; }
+				const page = await pullTableToFiles(ctx, instanceSettings, instanceName, { table, query, codeFields, limit: pageLimit, offset, openFiles: false });
+				entry.matchedRecords += page.matchedRecords;
+				entry.pulledRecords += page.pulledRecords;
+				entry.filesWritten += page.filesWritten;
+				entry.skippedEmpty += page.skippedEmpty;
+				if (includeRecords && entry.records) entry.records.push(...page.records);
+				for (const w of page.warnings) warnings.push(`${table}: ${w}`);
+				if (page.matchedRecords < pageLimit) break;
+			}
+			if (entry.truncated) warnings.push(`${table}: stopped at the per-table limit of ${limit} records; raise "limit" or pull the rest with pull_records.`);
+			totalRecords += entry.pulledRecords;
+			totalFiles += entry.filesWritten;
+			totalSkippedEmpty += entry.skippedEmpty;
+			if (!includeRecords) delete entry.records;
+			perTable.push(entry);
+			ctx.log(`Agent API: pull_scope ${scopeName}: ${table} ${entry.pulledRecords} record(s), ${entry.filesWritten} file(s)`);
+		}
+		for (const t of missingTables) warnings.push(`${t}: no records of this table in scope ${scopeName}.`);
 
 		return {
-			table,
-			matchedRecords: matchedRecords.length,
-			pulledRecords: pulledRecordsList.length,
-			filesWritten,
-			skippedEmpty,
+			scope: { name: scopeName, sys_id: scopeSysId },
+			folder: path.join(instanceName, scopeName).replace(/\\/g, '/'),
+			tables: perTable,
+			totals: { tables: perTable.length, records: totalRecords, filesWritten: totalFiles, skippedEmpty: totalSkippedEmpty },
+			skippedTables,
 			warnings,
-			records: pulledRecordsList,
 		};
 	},
 };
@@ -966,5 +1173,6 @@ export const recordsCommands: CommandHandler[] = [
 	check_name_exists_remote,
 	pull_records,
 	pull_artifacts,
+	pull_scope,
 ];
 

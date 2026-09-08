@@ -111,6 +111,7 @@ export class StandaloneHttpBridge {
                 'get_table_metadata',
                 'pull_records',
                 'pull_artifacts',
+                'pull_scope',
                 'code_search',
                 'run_background_script',
                 'get_form_state',

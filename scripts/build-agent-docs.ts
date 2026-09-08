@@ -142,7 +142,10 @@ const MANIFEST_OUTPUT = path.join(SKILLS_DIR, '_skills.json');
 //               createArtifacts, so an older helper that publishes only the
 //               five original gates still governs updates through the create
 //               grant instead of refusing them.
-const INSTRUCTIONS_VERSION = 23;
+//   v23 -> v24: added pull_scope: every scriptable artifact of one application
+//               scope to canonical local files, paged past the Table API
+//               limits (the Agent API counterpart of the Load Scope button).
+const INSTRUCTIONS_VERSION = 24;
 
 // Marker that identifies a file as an extension-managed skill. The extension
 // only ever deletes files that carry this marker, so user-authored files in the
@@ -156,7 +159,7 @@ const COMMAND_GROUPS: Array<{ label: string; cmds: string[] }> = [
 	{ label: 'Connection & state', cmds: ['check_connection', 'get_capabilities', 'get_review_result', 'list_instances', 'get_instance_info', 'get_sync_status', 'sync_now', 'get_last_error', 'clear_last_error'] },
 	{ label: 'Records — write', cmds: ['update_record', 'update_record_batch', 'create_record', 'create_artifact', 'delete_record'] },
 	{ label: 'Scoped-app ergonomics', cmds: ['create_application', 'create_table', 'add_column', 'delete_application'] },
-	{ label: 'Records — read', cmds: ['get_record', 'get_table_metadata', 'check_name_exists_remote', 'pull_records'] },
+	{ label: 'Records — read', cmds: ['get_record', 'get_table_metadata', 'check_name_exists_remote', 'pull_records', 'pull_scope'] },
 	{ label: 'Queries', cmds: ['query_records', 'get_parent_options', 'code_search'] },
 	{ label: 'Escape hatches', cmds: ['rest_request', 'run_background_script'] },
 	{ label: 'File-system helpers', cmds: ['list_tables', 'list_artifacts', 'check_name_exists', 'get_file_structure', 'validate_path'] },
@@ -178,6 +181,7 @@ const CDP_COMMANDS = new Set(['start_network_capture', 'stop_network_capture', '
 const EVERYDAY: Array<{ cmd: string; blurb: string }> = [
 	{ cmd: 'query_records', blurb: 'Encoded-query any table (fetch/check/explore records).' },
 	{ cmd: 'pull_records', blurb: 'Pull records from ServiceNow and write code fields to local files with _map.json sync.' },
+	{ cmd: 'pull_scope', blurb: 'Pull every scriptable artifact of one application scope to local files in one call (paged, refreshable).' },
 	{ cmd: 'get_record', blurb: 'Fetch one record by table + sys_id (e.g. confirm a write).' },
 	{ cmd: 'update_record', blurb: 'Update fields on an existing record (pass `await:true` to read back).' },
 	{ cmd: 'create_record', blurb: 'Create a plain data row (incident, task, user) — never drive the form UI to do this.' },

@@ -104,6 +104,7 @@ export function getCommandPolicy(req: AgentRequest): CommandPolicy {
 
     case 'pull_records':
     case 'pull_artifacts':
+    case 'pull_scope':
       return { risk: 'read', gates: [], review: 'never' };
 
     case 'take_screenshot': {

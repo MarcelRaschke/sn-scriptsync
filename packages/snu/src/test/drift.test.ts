@@ -26,6 +26,7 @@ const BRIDGE_COMMANDS = new Set([
   'check_name_exists_remote',
   'pull_records',
   'pull_artifacts',
+  'pull_scope',
   'query_records',
   'get_parent_options',
   'code_search',

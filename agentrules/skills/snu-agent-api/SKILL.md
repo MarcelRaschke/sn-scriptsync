@@ -3,7 +3,7 @@ name: snu-agent-api
 description: SN ScriptSync HTTP/file Agent API: endpoint discovery, auth, the full error-code table, and the complete command catalog (query_records, get_record, update_record, create_artifact, create_application, rest_request, screenshots, etc.). Read this before calling any Agent API command.
 ---
 
-<!-- SN-SCRIPTSYNC:SKILL instructionsSchemaVersion=23 -->
+<!-- SN-SCRIPTSYNC:SKILL instructionsSchemaVersion=24 -->
 
 # SN ScriptSync — Agent API
 
@@ -435,7 +435,7 @@ Immediately sync all pending files (flush the queue). Use this after making mult
 ```
 
 ### `get_last_error`
-Get the last error that occurred. Errors are automatically written to `_last_error.json` and pending Agent requests are failed when ServiceNow returns an error.
+Get the last error that occurred. Errors are automatically written to `_last_error.json` in the folder of the instance that reported them, and that instance's pending Agent requests are failed when ServiceNow returns an error. Other instance folders in the workspace are untouched.
 
 **Request:**
 ```json
@@ -451,7 +451,8 @@ Get the last error that occurred. Errors are automatically written to `_last_err
     "error": "ACL Error, try changing scope in the browser",
     "time": "2024-12-07T12:30:45.123Z",
     "timestamp": 1733567445123,
-    "details": { "message": "...", "detail": "..." }
+    "details": { "message": "...", "detail": "..." },
+    "instance": { "name": "dev221527", "url": "https://dev221527.service-now.com" }
   }
 }
 ```
@@ -1102,6 +1103,46 @@ Pull records from ServiceNow and store their code fields into canonical local wo
 - `E_BROWSER_DISCONNECTED` — the SN Utils helper tab is not connected.
 - `E_PAUSED` — agent commands are paused in the SN Utils helper tab.
 - `E_COMMAND_FAILED` — ServiceNow Table API query failed.
+
+### `pull_scope`
+
+Pull every scriptable artifact of one application scope into canonical local workspace files (`<instance>/<scope>/<table>/<name>.<field>.<ext>`, or `<table>/<name>/<field>.<ext>` for folder-record tables) with `_map.json` registration, so an agent can work from local files instead of fetching artifacts one by one. This is the Agent API counterpart of the VS Code **Load Scope** button.
+
+The command first lists which artifact tables the application actually uses, then walks each table that sn-scriptsync knows how to write to disk, paging past the Table API limits. Tables without code fields (properties, roles, ACL rows without scripts, ...) are reported under `skippedTables` and not written.
+
+**Request:**
+```json
+{
+  "id": "pull_scope_1",
+  "command": "pull_scope",
+  "params": { "scope": "x_acme_app" }
+}
+```
+
+**Parameters:**
+- `scope` (required, string): Application scope name (`x_acme_app`) or the `sys_scope` sys_id. `global` is refused: pull global artifacts with `pull_records` and a query instead.
+- `tables` (optional, string[]): Restrict the pull to these tables. Tables that hold no records in the scope are reported in `warnings`.
+- `limit` (optional, integer): Maximum records per table, `1` to `10000` (default `2000`). A table that hits the limit is marked `truncated`.
+- `includeRecords` (optional, boolean): Return the per-record file list inside each table entry (default `false`, keeps the response small for large applications).
+
+**Response:**
+```json
+{
+  "result": {
+    "scope": { "name": "x_acme_app", "sys_id": "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6" },
+    "folder": "dev221527/x_acme_app",
+    "tables": [
+      { "table": "sys_script", "matchedRecords": 12, "pulledRecords": 12, "filesWritten": 12, "skippedEmpty": 0, "truncated": false },
+      { "table": "sys_script_include", "matchedRecords": 140, "pulledRecords": 140, "filesWritten": 140, "skippedEmpty": 0, "truncated": false }
+    ],
+    "totals": { "tables": 2, "records": 152, "filesWritten": 152, "skippedEmpty": 0 },
+    "skippedTables": [ { "table": "sys_properties", "records": 4 } ],
+    "warnings": []
+  }
+}
+```
+
+Existing local files for the same records are refreshed in place and keep their file names through `_map.json`; a remote field that is now empty clears the local file. Run it again at any time to re-sync the whole application.
 
 ### `query_records` ⚡
 Execute an arbitrary encoded query against any ServiceNow table. Use this to fetch data, check conditions, or explore records.

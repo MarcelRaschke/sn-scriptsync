@@ -22,6 +22,7 @@ import * as path from "path";
 import nodePath = require('path');
 import * as fs from 'fs';
 import * as os from 'os';
+import { readErrorInstance, instanceFolderMatchesError } from './agent/errorRelay';
 import {
 	setRuntime as setAgentRuntime,
 	setSyncStateProvider,
@@ -59,6 +60,11 @@ import {
 let sass = require('sass');
 let metaDataRelations : any;
 let scopeTableResponseCount = 0;
+// Load Scope pages each table in chunks: the Table API silently truncates a
+// single request, so a large application used to lose every record past the
+// first hundred per table. Per-table totals feed the completion message.
+const SCOPE_LOAD_PAGE_SIZE = 200;
+let scopeLoadCounts: Record<string, number> = {};
 let scopeJson : any = {};
 
 let wss;
@@ -994,18 +1000,27 @@ function handleScreenshotResponse(responseJson: any) {
 	}
 }
 
-// Write _last_error.json for every instance folder so `get_last_error` works,
-// and fail any pending HTTP/file requests pointing at that folder.
+// Write _last_error.json for the instance folder the error came from so
+// `get_last_error` works, and fail any pending HTTP/file requests pointing at
+// that folder. Errors from helper builds that do not tag the instance (no
+// `errorInstance` on the message) fall back to every instance folder.
 function relayErrorToAgent(errorMessage: string, rawError?: any) {
 	try {
 		const workspaceRoot = getWorkspaceRoot() || '';
 		if (!workspaceRoot) return;
+		const errorInstance = readErrorInstance(rawError);
 		const folders = fs.readdirSync(workspaceRoot, { withFileTypes: true })
 			.filter(d => d.isDirectory() && !d.name.startsWith('.'));
 		for (const folder of folders) {
 			const settingsPath = path.join(workspaceRoot, folder.name, '_settings.json');
 			const oldSettingsPath = path.join(workspaceRoot, folder.name, 'settings.json');
-			if (!fs.existsSync(settingsPath) && !fs.existsSync(oldSettingsPath)) continue;
+			const presentSettingsPath = fs.existsSync(settingsPath) ? settingsPath : (fs.existsSync(oldSettingsPath) ? oldSettingsPath : null);
+			if (!presentSettingsPath) continue;
+			if (errorInstance) {
+				let settingsUrl: string | undefined;
+				try { settingsUrl = JSON.parse(fs.readFileSync(presentSettingsPath, 'utf8'))?.url; } catch { settingsUrl = undefined; }
+				if (!instanceFolderMatchesError(folder.name, settingsUrl, errorInstance)) continue;
+			}
 
 			const errorPath = path.join(workspaceRoot, folder.name, '_last_error.json');
 			fs.writeFileSync(errorPath, JSON.stringify({
@@ -1013,6 +1028,7 @@ function relayErrorToAgent(errorMessage: string, rawError?: any) {
 				time: new Date().toISOString(),
 				error: errorMessage,
 				details: rawError?.error || null,
+				instance: errorInstance ? { name: errorInstance.name || folder.name, url: errorInstance.url || null } : null,
 			}, null, 2));
 			debugLog(`Agent API: Error relayed to ${folder.name}/_last_error.json`);
 
@@ -2701,7 +2717,7 @@ async function startBridgeTransports(): Promise<void> {
 				// _last_error path for those so a single agent REST failure
 				// doesn't spam the UI or clobber the shared error file.
 				if (messageJson.hasOwnProperty('error') && !messageJson.agentRequestId) {
-					auditLog('remote_result_error', { action: messageJson?.action || 'unknown', detail: messageJson.error?.detail || null });
+					auditLog('remote_result_error', { action: messageJson?.action || 'unknown', detail: messageJson.error?.detail || null, instance: readErrorInstance(messageJson)?.name || null });
 					let errorDetail = '';
 					const rawDetail = messageJson.error?.detail;
 					if (rawDetail) {
@@ -2720,7 +2736,8 @@ async function startBridgeTransports(): Promise<void> {
 						errorDetail = JSON.stringify(messageJson, null, 2);
 					}
 
-					// Relay error to Agent API - write to _last_error.json in all instance folders
+					// Relay error to Agent API - _last_error.json in the erroring
+					// instance folder (every folder for untagged helper errors)
 					relayErrorToAgent(errorDetail, messageJson);
 
 					// Pause queue on error if there are pending files
@@ -3301,6 +3318,7 @@ function writeInstanceMetaDataScope(messageJson){
 	})
 
 	scopeTableResponseCount = 0; //initialize the response counter
+	scopeLoadCounts = {};
 	scopeJson = {
 		scopeMeta : {
 			name :  messageJson.scopeName,
@@ -3330,8 +3348,10 @@ function writeInstanceMetaDataScope(messageJson){
 			requestJson.scopeTableRequestCount = scopeCodeTables.length;
 			requestJson.displayValueField = 'sys_name';
 			requestJson.fields = Object.keys({...metaDataRelations.tableFields[table].codeFields, ...metaDataRelations.tableFields[table].referenceFields});
-			requestJson.queryString = `sysparm_fields=sys_name,sys_id,${requestJson.fields}&sysparm_query=sys_scope=${scope}^sys_class_name=${table}&sysparm_exclude_reference_link=true&sysparm_no_count=true&&sysparm_limit=100`;
-		
+			requestJson.pageSize = SCOPE_LOAD_PAGE_SIZE;
+			requestJson.pageOffset = 0;
+			requestJson.queryString = `sysparm_fields=sys_name,sys_id,${requestJson.fields}&sysparm_query=sys_scope=${scope}^sys_class_name=${table}^ORDERBYsys_id&sysparm_exclude_reference_link=true&sysparm_no_count=true&sysparm_limit=${SCOPE_LOAD_PAGE_SIZE}&sysparm_offset=0`;
+
 			requestRecords(requestJson);
 		}
 
@@ -3444,7 +3464,22 @@ function writeTableFields(messageJson) {
 
 	if (Object.keys(nameToSysId).length)
 		eu.writeOrReadNameToSysIdMapping(scopeMappingFile, nameToSysId);
-	
+
+	// A full page means there may be more: ask for the next one and only count
+	// the table as finished when a short page arrives.
+	const pageSize = Number(messageJson.pageSize) || 0;
+	const received = Array.isArray(messageJson.results) ? messageJson.results.length : 0;
+	scopeLoadCounts[messageJson.tableName] = (scopeLoadCounts[messageJson.tableName] || 0) + received;
+	if (pageSize > 0 && received >= pageSize) {
+		const nextPage: any = { ...messageJson };
+		delete nextPage.results;
+		delete nextPage.type;
+		nextPage.pageOffset = (Number(messageJson.pageOffset) || 0) + pageSize;
+		nextPage.queryString = String(messageJson.queryString || '').replace(/sysparm_offset=\d+/, `sysparm_offset=${nextPage.pageOffset}`);
+		requestRecords(nextPage);
+		return;
+	}
+
 	scopeTableResponseCount++;
 	if (messageJson.scopeTableRequestCount == scopeTableResponseCount){
 		//after all response from tables returned value, save the file from memory to the scope.json file
@@ -3509,7 +3544,9 @@ function writeTableFields(messageJson) {
 			let strObj = JSON.stringify(scopeJson,null,2);
 			eu.writeFile(messageJson.scopeFilePath, strObj, false, function () { });
 			setScopeTree();
-			eu.showMessage("Loading scope artifacts finished!", 2000);
+			const loadedTables = Object.keys(scopeLoadCounts).filter(t => scopeLoadCounts[t] > 0);
+			const loadedRecords = loadedTables.reduce((sum, t) => sum + scopeLoadCounts[t], 0);
+			eu.showMessage(`Loading scope artifacts finished: ${loadedRecords} record${loadedRecords === 1 ? '' : 's'} from ${loadedTables.length} table${loadedTables.length === 1 ? '' : 's'}.`, 4000);
 		},1000);
 
 

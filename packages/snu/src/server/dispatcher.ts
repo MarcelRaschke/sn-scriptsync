@@ -444,6 +444,199 @@ export class StandaloneDispatcher {
     }
   }
 
+  // One page of one table into canonical workspace files. Shared by
+  // pull_records (a single page the caller sized) and pull_scope (which walks
+  // every code table of an application page by page).
+  private async pullTablePage(inst: { name: string; settings: any }, reqCommand: string, opts: { table: string; query: string; codeFields: string[]; limit: number; offset?: number }) {
+    const { table, codeFields, limit } = opts;
+    const combinedQuery = opts.query;
+    const offset = opts.offset || 0;
+    const displayFields = ['sys_id', 'name', 'sys_name', 'short_description', 'sys_scope', 'sys_scope.scope'];
+    const allRequestedFields = Array.from(new Set([...displayFields, ...codeFields])).join(',');
+
+    const queryParams: Record<string, string> = {
+      sysparm_fields: allRequestedFields,
+      sysparm_limit: String(limit),
+      sysparm_offset: String(offset),
+      sysparm_display_value: 'false',
+      sysparm_exclude_reference_link: 'true',
+      sysparm_no_count: 'true',
+    };
+    if (combinedQuery) {
+      queryParams.sysparm_query = combinedQuery;
+    }
+
+    const correlationId = crypto.randomUUID();
+    const pendingPromise = this.pending.register({ id: correlationId, command: reqCommand, timeoutMs: 70_000 });
+    this.ws.sendToBrowser({
+      action: 'agentRestApi',
+      agentRequestId: correlationId,
+      endpoint: `/api/now/table/${table}`,
+      method: 'GET',
+      queryParams,
+      instance: inst.settings,
+      appName: 'SN Utils CLI',
+    });
+    const res = await pendingPromise;
+    if (res.success === false) {
+      throw Object.assign(new Error(res.error || 'Failed to pull records'), { code: 'E_COMMAND_FAILED' });
+    }
+
+    const matchedRecords: any[] = Array.isArray(res.data?.result) ? res.data.result : (res.data?.result ? [res.data.result] : []);
+    const isFolderRecordTable = FOLDERRECORDTABLES.includes(table);
+
+    let filesWritten = 0;
+    let skippedEmpty = 0;
+    const warnings: string[] = [];
+    const pulledRecordsList: Array<{
+      sys_id: string;
+      name: string;
+      scope: string;
+      files: Array<{ field: string; path: string; bytes: number; action: 'created' | 'updated' | 'cleared' | 'skipped_empty' }>;
+    }> = [];
+
+    for (const rec of matchedRecords) {
+      const sysId = typeof rec.sys_id === 'object' ? rec.sys_id.value : String(rec.sys_id || '');
+      if (!sysId) continue;
+
+      let scope = 'global';
+      if (rec['sys_scope.scope']) {
+        scope = String(rec['sys_scope.scope']);
+      } else if (rec.sys_scope) {
+        scope = typeof rec.sys_scope === 'object' ? String(rec.sys_scope.value || rec.sys_scope.display_value || 'global') : String(rec.sys_scope);
+      }
+      if (!scope || scope === 'null' || scope === 'undefined') scope = 'global';
+
+      const rawName = rec.name || rec.sys_name || rec.short_description || sysId;
+      const name = String(rawName).trim();
+
+      let mapPath: string;
+      try {
+        mapPath = safeJoinUnderRoot(this.cwd, inst.name, scope, table, '_map.json');
+      } catch (e: any) {
+        warnings.push(`Could not resolve map path for ${scope}/${table}: ${e?.message || e}`);
+        continue;
+      }
+
+      const { cleanName, renamedTo, map: nameToSysId } = resolveMappedFileName(mapPath, name, sysId);
+      try {
+        writeMapFile(mapPath, nameToSysId);
+      } catch (e: any) {
+        warnings.push(`Failed to write _map.json at ${mapPath}: ${e?.message || e}`);
+      }
+      if (renamedTo) {
+        warnings.push(`Record ${sysId} is named '${renamedTo}' on the instance but keeps local file name '${cleanName}' (rename tracked in _map.json).`);
+      }
+
+      if (table === 'sp_widget') {
+        try {
+          const testUrlsPath = safeJoinUnderRoot(this.cwd, inst.name, scope, table, cleanName, '_test_urls.txt');
+          if (!fs.existsSync(testUrlsPath)) {
+            const dispVal = name.toLowerCase().replace(/\s+/g, '_');
+            const testUrls = [
+              `${inst.settings.url}/$sp.do?id=sp-preview&sys_id=${sysId}`,
+              `${inst.settings.url}/sp_config?id=${dispVal}`,
+              `${inst.settings.url}/sp?id=${dispVal}`,
+              `${inst.settings.url}/esc?id=${dispVal}`,
+            ].join('\n');
+            fs.mkdirSync(path.dirname(testUrlsPath), { recursive: true });
+            fs.writeFileSync(testUrlsPath, testUrls, 'utf8');
+          }
+        } catch {}
+      }
+
+      const recordFiles: Array<{ field: string; path: string; bytes: number; action: 'created' | 'updated' | 'cleared' | 'skipped_empty' }> = [];
+
+      for (const field of codeFields) {
+        const ext = resolveFieldExtension(table, field, this.cwd);
+        let targetPath: string;
+        try {
+          targetPath = isFolderRecordTable
+            ? safeJoinUnderRoot(this.cwd, inst.name, scope, table, cleanName, `${field}${ext}`)
+            : safeJoinUnderRoot(this.cwd, inst.name, scope, table, `${cleanName}.${field}${ext}`);
+        } catch (e: any) {
+          warnings.push(`Unsafe path for ${scope}/${table}/${cleanName}.${field}: ${e?.message || e}`);
+          continue;
+        }
+
+        const relPath = path.relative(this.cwd, targetPath).replace(/\\/g, '/');
+        const rawVal = rec[field];
+        const content = rawVal !== null && rawVal !== undefined ? String(rawVal) : '';
+        const fileExisted = fs.existsSync(targetPath);
+
+        if (content.length > 0) {
+          try {
+            fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+            fs.writeFileSync(targetPath, content, 'utf8');
+            filesWritten++;
+            const action = fileExisted ? 'updated' : 'created';
+            recordFiles.push({ field, path: relPath, bytes: Buffer.byteLength(content, 'utf8'), action });
+          } catch (e: any) {
+            warnings.push(`Failed to write ${relPath}: ${e?.message || e}`);
+          }
+        } else if (fileExisted) {
+          try {
+            fs.writeFileSync(targetPath, '', 'utf8');
+            filesWritten++;
+            recordFiles.push({ field, path: relPath, bytes: 0, action: 'cleared' });
+          } catch (e: any) {
+            warnings.push(`Failed to clear ${relPath}: ${e?.message || e}`);
+          }
+        } else {
+          skippedEmpty++;
+          recordFiles.push({ field, path: relPath, bytes: 0, action: 'skipped_empty' });
+        }
+      }
+
+      pulledRecordsList.push({
+        sys_id: sysId,
+        name,
+        scope,
+        files: recordFiles,
+      });
+    }
+
+    return {
+      table,
+      matchedRecords: matchedRecords.length,
+      pulledRecords: pulledRecordsList.length,
+      filesWritten,
+      skippedEmpty,
+      warnings,
+      records: pulledRecordsList,
+    };
+  }
+
+  // Which artifact tables snu knows how to write to disk: the ones in
+  // resources/metaDataRelations.json that declare code fields.
+  private allCodeTables(): Set<string> {
+    const meta = getMetaDataRelations(this.cwd);
+    const out = new Set<string>();
+    for (const [table, def] of Object.entries<any>(meta?.tableFields || {})) {
+      if (def?.codeFields && typeof def.codeFields === 'object') out.add(table);
+    }
+    return out;
+  }
+
+  private async restGet(inst: { settings: any }, reqCommand: string, endpoint: string, queryParams: Record<string, string>): Promise<any> {
+    const correlationId = crypto.randomUUID();
+    const pendingPromise = this.pending.register({ id: correlationId, command: reqCommand, timeoutMs: 70_000 });
+    this.ws.sendToBrowser({
+      action: 'agentRestApi',
+      agentRequestId: correlationId,
+      endpoint,
+      method: 'GET',
+      queryParams,
+      instance: inst.settings,
+      appName: 'SN Utils CLI',
+    });
+    const res: any = await pendingPromise;
+    if (res?.success === false) {
+      throw Object.assign(new Error(res.error || `REST request failed: ${endpoint}`), { code: res.code || 'E_COMMAND_FAILED' });
+    }
+    return res?.data;
+  }
+
   resolveInstance(requestInstance?: string): { name: string; folder: string; settings: any } {
     const folders = this.listInstanceFolders();
     const liveInstances = this.ws.getLiveInstances();
@@ -1203,6 +1396,145 @@ export class StandaloneDispatcher {
         };
       }
 
+      // Pull Scope: every scriptable artifact of one application, paged
+      if (req.command === 'pull_scope') {
+        const rawScope = req.params?.scope;
+        if (!rawScope || typeof rawScope !== 'string' || !rawScope.trim()) {
+          throw Object.assign(new Error('Missing required param "scope" (application scope name such as x_acme_app, or its sys_scope sys_id)'), { code: 'E_INVALID_PARAMS' });
+        }
+        const scopeParam = rawScope.trim();
+        if (scopeParam === 'global') {
+          throw Object.assign(new Error('pull_scope targets one application; the global scope is too large to pull whole. Use pull_records with a query instead.'), { code: 'E_INVALID_PARAMS' });
+        }
+        if (!/^[A-Za-z0-9_]+$/.test(scopeParam)) {
+          throw Object.assign(new Error('Parameter "scope" must be a scope name (letters, digits, underscore) or a 32-character sys_id.'), { code: 'E_INVALID_PARAMS' });
+        }
+        const PAGE = 100, DEFAULT_LIMIT = 2000, MAX_LIMIT = 10000;
+        let limit = DEFAULT_LIMIT;
+        if (req.params?.limit !== undefined) {
+          if (typeof req.params.limit !== 'number' || !Number.isInteger(req.params.limit) || req.params.limit < 1 || req.params.limit > MAX_LIMIT) {
+            throw Object.assign(new Error(`Parameter "limit" must be an integer between 1 and ${MAX_LIMIT} (records per table).`), { code: 'E_INVALID_PARAMS' });
+          }
+          limit = req.params.limit;
+        }
+        let tableFilter: Set<string> | null = null;
+        if (req.params?.tables !== undefined) {
+          const raw = Array.isArray(req.params.tables) ? req.params.tables : (typeof req.params.tables === 'string' ? req.params.tables.split(',') : null);
+          if (!raw) throw Object.assign(new Error('Parameter "tables" must be an array of table names.'), { code: 'E_INVALID_PARAMS' });
+          tableFilter = new Set<string>();
+          for (const t of raw) {
+            if (typeof t !== 'string' || !/^[A-Za-z0-9_]+$/.test(t.trim())) {
+              throw Object.assign(new Error(`Invalid table name in "tables": ${String(t)}`), { code: 'E_INVALID_PARAMS' });
+            }
+            tableFilter.add(t.trim());
+          }
+        }
+        const includeRecords = req.params?.includeRecords === true;
+
+        // Resolve the scope: sys_id as given, else scopes.json, else the instance.
+        let scopeSysId: string | undefined;
+        let scopeName: string | undefined;
+        const scopesPath = path.join(this.cwd, inst.name, 'scopes.json');
+        let scopes: Record<string, string> = {};
+        try { scopes = JSON.parse(fs.readFileSync(scopesPath, 'utf8')) || {}; } catch {}
+        if (/^[0-9a-fA-F]{32}$/.test(scopeParam)) {
+          scopeSysId = scopeParam.toLowerCase();
+          scopeName = Object.keys(scopes).find((k) => String(scopes[k]).toLowerCase() === scopeSysId);
+        } else {
+          scopeName = scopeParam;
+          scopeSysId = scopes[scopeName] ? String(scopes[scopeName]).toLowerCase() : undefined;
+        }
+        if (!scopeSysId || !scopeName) {
+          const data = await this.restGet(inst, req.command, '/api/now/table/sys_scope', {
+            sysparm_query: scopeSysId ? `sys_id=${scopeSysId}` : `scope=${scopeName}`,
+            sysparm_fields: 'sys_id,scope,name',
+            sysparm_limit: '1',
+            sysparm_exclude_reference_link: 'true',
+            sysparm_no_count: 'true',
+          });
+          const row = Array.isArray(data?.result) ? data.result[0] : data?.result;
+          if (!row?.sys_id) {
+            throw Object.assign(new Error(`Application scope "${scopeParam}" was not found on ${inst.name}.`), { code: 'E_NOT_FOUND' });
+          }
+          scopeSysId = String(typeof row.sys_id === 'object' ? row.sys_id.value : row.sys_id).toLowerCase();
+          scopeName = String(typeof row.scope === 'object' ? row.scope.value : row.scope);
+          try {
+            scopes[scopeName] = scopeSysId;
+            fs.mkdirSync(path.dirname(scopesPath), { recursive: true });
+            fs.writeFileSync(scopesPath, JSON.stringify(scopes, null, 2));
+          } catch {}
+        }
+
+        // Which artifact tables does this application actually use?
+        const classCounts = new Map<string, number>();
+        const metaPage = 1000;
+        for (let offset = 0; ; offset += metaPage) {
+          const data = await this.restGet(inst, req.command, '/api/now/table/sys_metadata', {
+            sysparm_query: `sys_scope=${scopeSysId}^sys_class_name!=sys_metadata_delete^sys_update_name!=NULL^ORDERBYsys_id`,
+            sysparm_fields: 'sys_class_name',
+            sysparm_limit: String(metaPage),
+            sysparm_offset: String(offset),
+            sysparm_exclude_reference_link: 'true',
+            sysparm_no_count: 'true',
+          });
+          const rows: any[] = Array.isArray(data?.result) ? data.result : [];
+          for (const r of rows) {
+            const cls = String(typeof r.sys_class_name === 'object' ? r.sys_class_name.value : r.sys_class_name || '');
+            if (cls) classCounts.set(cls, (classCounts.get(cls) || 0) + 1);
+          }
+          if (rows.length < metaPage) break;
+        }
+
+        const codeTables = this.allCodeTables();
+        const tables = [...classCounts.keys()].filter((t) => codeTables.has(t) && (!tableFilter || tableFilter.has(t))).sort();
+        const skippedTables = [...classCounts.keys()].filter((t) => !codeTables.has(t)).sort()
+          .map((t) => ({ table: t, records: classCounts.get(t) || 0 }));
+        const missingTables = tableFilter ? [...tableFilter].filter((t) => !classCounts.has(t)).sort() : [];
+
+        const perTable: any[] = [];
+        const warnings: string[] = [];
+        let totalRecords = 0, totalFiles = 0, totalSkippedEmpty = 0;
+        for (const table of tables) {
+          const codeFields = resolveTableCodeFields(table, this.cwd);
+          const query = `sys_scope=${scopeSysId}^sys_class_name=${table}^ORDERBYsys_id`;
+          const entry: any = { table, matchedRecords: 0, pulledRecords: 0, filesWritten: 0, skippedEmpty: 0, truncated: false };
+          if (includeRecords) entry.records = [];
+          for (let offset = 0; ; offset += PAGE) {
+            const pageLimit = Math.min(PAGE, limit - entry.matchedRecords);
+            if (pageLimit <= 0) { entry.truncated = true; break; }
+            const page = await this.pullTablePage(inst, req.command, { table, query, codeFields, limit: pageLimit, offset });
+            entry.matchedRecords += page.matchedRecords;
+            entry.pulledRecords += page.pulledRecords;
+            entry.filesWritten += page.filesWritten;
+            entry.skippedEmpty += page.skippedEmpty;
+            if (includeRecords) entry.records.push(...page.records);
+            for (const w of page.warnings) warnings.push(`${table}: ${w}`);
+            if (page.matchedRecords < pageLimit) break;
+          }
+          if (entry.truncated) warnings.push(`${table}: stopped at the per-table limit of ${limit} records; raise "limit" or pull the rest with pull_records.`);
+          totalRecords += entry.pulledRecords;
+          totalFiles += entry.filesWritten;
+          totalSkippedEmpty += entry.skippedEmpty;
+          perTable.push(entry);
+        }
+        for (const t of missingTables) warnings.push(`${t}: no records of this table in scope ${scopeName}.`);
+
+        return {
+          id: req.id,
+          command: req.command,
+          status: 'success',
+          timestamp: Date.now(),
+          result: {
+            scope: { name: scopeName, sys_id: scopeSysId },
+            folder: path.join(inst.name, scopeName).replace(/\\/g, '/'),
+            tables: perTable,
+            totals: { tables: perTable.length, records: totalRecords, filesWritten: totalFiles, skippedEmpty: totalSkippedEmpty },
+            skippedTables,
+            warnings,
+          },
+        };
+      }
+
       // Pull Records / Pull Artifacts
       if (req.command === 'pull_records' || req.command === 'pull_artifacts') {
         const rawTable = req.params?.table;
@@ -1260,164 +1592,8 @@ export class StandaloneDispatcher {
           codeFields = resolveTableCodeFields(table, this.cwd);
         }
 
-        const displayFields = ['sys_id', 'name', 'sys_name', 'short_description', 'sys_scope', 'sys_scope.scope'];
-        const allRequestedFields = Array.from(new Set([...displayFields, ...codeFields])).join(',');
-
-        const queryParams: Record<string, string> = {
-          sysparm_fields: allRequestedFields,
-          sysparm_limit: String(limit),
-          sysparm_display_value: 'false',
-          sysparm_exclude_reference_link: 'true',
-          sysparm_no_count: 'true',
-        };
-        if (combinedQuery) {
-          queryParams.sysparm_query = combinedQuery;
-        }
-
-        const pendingPromise = this.pending.register({ id: correlationId, command: req.command, timeoutMs: 70_000 });
-        this.ws.sendToBrowser({
-          action: 'agentRestApi',
-          agentRequestId: correlationId,
-          endpoint: `/api/now/table/${table}`,
-          method: 'GET',
-          queryParams,
-          instance: inst.settings,
-          appName: 'SN Utils CLI',
-        });
-        const res = await pendingPromise;
-        if (res.success === false) {
-          throw Object.assign(new Error(res.error || 'Failed to pull records'), { code: 'E_COMMAND_FAILED' });
-        }
-
-        const matchedRecords: any[] = Array.isArray(res.data?.result) ? res.data.result : (res.data?.result ? [res.data.result] : []);
-        const isFolderRecordTable = FOLDERRECORDTABLES.includes(table);
-
-        let filesWritten = 0;
-        let skippedEmpty = 0;
-        const warnings: string[] = [];
-        const pulledRecordsList: Array<{
-          sys_id: string;
-          name: string;
-          scope: string;
-          files: Array<{ field: string; path: string; bytes: number; action: 'created' | 'updated' | 'cleared' | 'skipped_empty' }>;
-        }> = [];
-
-        for (const rec of matchedRecords) {
-          const sysId = typeof rec.sys_id === 'object' ? rec.sys_id.value : String(rec.sys_id || '');
-          if (!sysId) continue;
-
-          let scope = 'global';
-          if (rec['sys_scope.scope']) {
-            scope = String(rec['sys_scope.scope']);
-          } else if (rec.sys_scope) {
-            scope = typeof rec.sys_scope === 'object' ? String(rec.sys_scope.value || rec.sys_scope.display_value || 'global') : String(rec.sys_scope);
-          }
-          if (!scope || scope === 'null' || scope === 'undefined') scope = 'global';
-
-          const rawName = rec.name || rec.sys_name || rec.short_description || sysId;
-          const name = String(rawName).trim();
-
-          let mapPath: string;
-          try {
-            mapPath = safeJoinUnderRoot(this.cwd, inst.name, scope, table, '_map.json');
-          } catch (e: any) {
-            warnings.push(`Could not resolve map path for ${scope}/${table}: ${e?.message || e}`);
-            continue;
-          }
-
-          const { cleanName, renamedTo, map: nameToSysId } = resolveMappedFileName(mapPath, name, sysId);
-          try {
-            writeMapFile(mapPath, nameToSysId);
-          } catch (e: any) {
-            warnings.push(`Failed to write _map.json at ${mapPath}: ${e?.message || e}`);
-          }
-          if (renamedTo) {
-            warnings.push(`Record ${sysId} is named '${renamedTo}' on the instance but keeps local file name '${cleanName}' (rename tracked in _map.json).`);
-          }
-
-          if (table === 'sp_widget') {
-            try {
-              const testUrlsPath = safeJoinUnderRoot(this.cwd, inst.name, scope, table, cleanName, '_test_urls.txt');
-              if (!fs.existsSync(testUrlsPath)) {
-                const dispVal = name.toLowerCase().replace(/\s+/g, '_');
-                const testUrls = [
-                  `${inst.settings.url}/$sp.do?id=sp-preview&sys_id=${sysId}`,
-                  `${inst.settings.url}/sp_config?id=${dispVal}`,
-                  `${inst.settings.url}/sp?id=${dispVal}`,
-                  `${inst.settings.url}/esc?id=${dispVal}`,
-                ].join('\n');
-                fs.mkdirSync(path.dirname(testUrlsPath), { recursive: true });
-                fs.writeFileSync(testUrlsPath, testUrls, 'utf8');
-              }
-            } catch {}
-          }
-
-          const recordFiles: Array<{ field: string; path: string; bytes: number; action: 'created' | 'updated' | 'cleared' | 'skipped_empty' }> = [];
-
-          for (const field of codeFields) {
-            const ext = resolveFieldExtension(table, field, this.cwd);
-            let targetPath: string;
-            try {
-              targetPath = isFolderRecordTable
-                ? safeJoinUnderRoot(this.cwd, inst.name, scope, table, cleanName, `${field}${ext}`)
-                : safeJoinUnderRoot(this.cwd, inst.name, scope, table, `${cleanName}.${field}${ext}`);
-            } catch (e: any) {
-              warnings.push(`Unsafe path for ${scope}/${table}/${cleanName}.${field}: ${e?.message || e}`);
-              continue;
-            }
-
-            const relPath = path.relative(this.cwd, targetPath).replace(/\\/g, '/');
-            const rawVal = rec[field];
-            const content = rawVal !== null && rawVal !== undefined ? String(rawVal) : '';
-            const fileExisted = fs.existsSync(targetPath);
-
-            if (content.length > 0) {
-              try {
-                fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-                fs.writeFileSync(targetPath, content, 'utf8');
-                filesWritten++;
-                const action = fileExisted ? 'updated' : 'created';
-                recordFiles.push({ field, path: relPath, bytes: Buffer.byteLength(content, 'utf8'), action });
-              } catch (e: any) {
-                warnings.push(`Failed to write ${relPath}: ${e?.message || e}`);
-              }
-            } else if (fileExisted) {
-              try {
-                fs.writeFileSync(targetPath, '', 'utf8');
-                filesWritten++;
-                recordFiles.push({ field, path: relPath, bytes: 0, action: 'cleared' });
-              } catch (e: any) {
-                warnings.push(`Failed to clear ${relPath}: ${e?.message || e}`);
-              }
-            } else {
-              skippedEmpty++;
-              recordFiles.push({ field, path: relPath, bytes: 0, action: 'skipped_empty' });
-            }
-          }
-
-          pulledRecordsList.push({
-            sys_id: sysId,
-            name,
-            scope,
-            files: recordFiles,
-          });
-        }
-
-        return {
-          id: req.id,
-          command: req.command,
-          status: 'success',
-          timestamp: Date.now(),
-          result: {
-            table,
-            matchedRecords: matchedRecords.length,
-            pulledRecords: pulledRecordsList.length,
-            filesWritten,
-            skippedEmpty,
-            warnings,
-            records: pulledRecordsList,
-          },
-        };
+        const result = await this.pullTablePage(inst, req.command, { table, query: combinedQuery, codeFields, limit, offset: 0 });
+        return { id: req.id, command: req.command, status: 'success', timestamp: Date.now(), result };
       }
 
       // Generic REST passthrough. The escape hatch the typed commands are built

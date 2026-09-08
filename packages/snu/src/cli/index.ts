@@ -97,6 +97,8 @@ export function printHelp(): void {
   run [script]                        Execute server-side Background Script and capture output
 
 \x1b[1mRECORD & ARTIFACT COMMANDS:\x1b[0m
+  pull <table> [query]                Pull records to local files (code fields + _map.json)
+  pull-scope <scope>                  Pull every scriptable artifact of an application scope
   record get <table> <sys_id>         Fetch a record by sys_id
   record create <table> [f=v ...]     Create a data row (incident, task, user) via the REST API
   record update <table> <sys_id> <f>  Update a record field (--value <v>, --file <p>, or stdin)
@@ -665,6 +667,17 @@ export async function runCli(argv = process.argv.slice(2)): Promise<void> {
         if (!positionals[0]) throw new ScriptSyncClientError('Missing required table: snu query <table> [query]', 'E_INVALID_PARAMS');
         inputData.table = positionals[0];
         inputData.query = positionals.slice(1).join(' ') || values.query;
+        break;
+
+      case 'pull':
+        if (!positionals[0]) throw new ScriptSyncClientError('Missing required table: snu pull <table> [query]', 'E_INVALID_PARAMS');
+        inputData.table = positionals[0];
+        inputData.query = positionals.slice(1).join(' ') || values.query;
+        break;
+
+      case 'pull-scope':
+        if (!positionals[0]) throw new ScriptSyncClientError('Missing required scope: snu pull-scope <scope>', 'E_INVALID_PARAMS');
+        inputData.scope = positionals[0];
         break;
 
       case 'record get':
