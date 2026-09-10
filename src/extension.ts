@@ -3,6 +3,8 @@ import { window, workspace, commands, Disposable, ExtensionContext, StatusBarAli
 import * as WebSocket from 'ws';
 import * as vscode from 'vscode';
 import { ScopeTreeViewProvider } from "./ScopeTreeViewProvider";
+import { ScopeMetadataLoader } from "./ScopeMetadataLoader";
+import { HelperConnection } from "./HelperConnection";
 import { InfoTreeViewProvider } from "./InfoTreeViewProvider";
 import { QueueTreeViewProvider } from "./QueueTreeViewProvider";
 import { ExtensionUtils } from "./ExtensionUtils";
@@ -64,10 +66,18 @@ let scopeTableResponseCount = 0;
 // single request, so a large application used to lose every record past the
 // first hundred per table. Per-table totals feed the completion message.
 const SCOPE_LOAD_PAGE_SIZE = 200;
+const scopeMetadataLoader = new ScopeMetadataLoader(requestRecords, writeInstanceMetaDataScope, SCOPE_LOAD_PAGE_SIZE);
 let scopeLoadCounts: Record<string, number> = {};
 let scopeJson : any = {};
 
 let wss;
+const helperConnection = new HelperConnection<WebSocket>(() => {
+	connectedHelperInfo = null;
+	helperInstanceGates.clear();
+	helperInstanceGateRevisions.clear();
+	helperLiveInstances.clear();
+	pendingRegistry.rejectAll('E_BROWSER_DISCONNECTED', 'Browser helper disconnected. Open the SN Utils helper tab and try again.');
+});
 let serverRunning = false;
 let agentHttpState: HttpServerState | undefined;
 /** Editor commands/views are registered once per activation, never per start. */
@@ -1245,7 +1255,7 @@ export function activate(context: vscode.ExtensionContext) {
 	// command handler runs so getRuntime()/getSyncState() don't throw.
 	setAgentRuntime({
 		sendToBrowser: (payload) => broadcastToHelperTab(payload),
-		hasBrowserClient: () => !!wss && wss.clients.size > 0,
+		hasBrowserClient: () => helperConnection.connected,
 		isServerRunning: () => serverRunning,
 		log: (msg) => debugLog(msg),
 		reviewWritesEnabled: () => reviewWritesEnabled(),
@@ -1525,7 +1535,7 @@ export function activate(context: vscode.ExtensionContext) {
 		if (!serverRunning) return;
 
 		if (listener.document.fileName.endsWith('css') && listener.document.fileName.includes('sp_widget')) {
-			if (!wss.clients.size) {
+			if (!helperConnection.connected) {
 				vscode.window.showErrorMessage("No WebSocket connection. Please open SN Utils Helper tab in a browser via slashcommand /token");
 			}
 			var scriptObj = <any>{};
@@ -2534,6 +2544,7 @@ async function startBridgeTransports(): Promise<void> {
 	//Start WebSocket Server
 	// Defensive: if a previous instance is somehow still around (e.g. a rapid
 	// stop→start), tear it down so we don't try to bind port 1978 twice.
+	helperConnection.stop();
 	if (wss) {
 		try {
 			wss.clients.forEach((client) => { try { client.terminate(); } catch { /* ignore */ } });
@@ -2571,7 +2582,7 @@ async function startBridgeTransports(): Promise<void> {
 		// is a few microtasks after the socket starts accepting connections.
 		// Accept during 'starting' too, so a helper that reconnects the instant
 		// the port opens is not dropped.
-		if (!serverRunning && bridgeLifecycle.state !== 'starting') return;
+		if (!serverRunning && bridgeLifecycle.state !== 'starting') { ws.terminate(); return; }
 
 		// A (re)connect is a natural moment to heal port files another process
 		// may have deleted while this bridge stayed alive. Fire-and-forget: the
@@ -2583,14 +2594,7 @@ async function startBridgeTransports(): Promise<void> {
 			return;
 		}
 
-		// Evict any previous stale connections so the newest tab/reconnection takes over
-		wss.clients.forEach((client: WebSocket) => {
-			if (client !== ws) {
-				try {
-					client.terminate();
-				} catch { /* ignore */ }
-			}
-		});
+		helperConnection.accept(ws);
 
 		let helperBuildInfo: {
 			debuggerAvailable?: boolean;
@@ -2604,7 +2608,7 @@ async function startBridgeTransports(): Promise<void> {
 		let capabilityMessageSent = false;
 		let debugLicenseTimer: ReturnType<typeof setTimeout> | undefined;
 		const sendCapabilityMessage = () => {
-			if (capabilityMessageSent) return;
+			if (capabilityMessageSent || !helperConnection.isActive(ws)) return;
 
 			let message: string | undefined;
 			capabilityMessageSent = true;
@@ -2657,14 +2661,10 @@ async function startBridgeTransports(): Promise<void> {
 		ws.on('close', () => {
 			clearTimeout(capabilityMessageTimer);
 			if (debugLicenseTimer) clearTimeout(debugLicenseTimer);
-			connectedHelperInfo = null;
-			helperInstanceGates.clear();
-			helperInstanceGateRevisions.clear();
-			helperLiveInstances.clear();
-			pendingRegistry.rejectAll('E_BROWSER_DISCONNECTED', 'Browser helper disconnected. Open the SN Utils helper tab and try again.');
 		});
 
 		ws.on('message', function incoming(message) {
+			if (!helperConnection.isActive(ws)) return;
 			let messageJson;
 			try {
 				messageJson = JSON.parse(message);
@@ -2858,7 +2858,7 @@ async function startBridgeTransports(): Promise<void> {
 					writeInstanceScope(messageJson);
 				}
 				else if (messageJson.actionGoal == 'writeInstanceMetaDataScope') {
-					writeInstanceMetaDataScope(messageJson);
+					scopeMetadataLoader.accept(messageJson);
 				}
 				else if (messageJson.actionGoal == 'writeTableFields') {
 					writeTableFields(messageJson);
@@ -3084,6 +3084,8 @@ async function stopBridgeTransports(): Promise<void> {
 	// sockets (the connected helper tab) open, which keeps port 1978 bound and
 	// makes the next startServers() fail with EADDRINUSE. Terminate the clients
 	// first so the port is actually released and the server can start again.
+	pendingRegistry.rejectAll('E_SERVER_NOT_RUNNING', 'ScriptSync server stopped.');
+	helperConnection.stop();
 	if (wss) {
 		try {
 			wss.clients.forEach((client) => { try { client.terminate(); } catch { /* ignore */ } });
@@ -3103,7 +3105,6 @@ async function stopBridgeTransports(): Promise<void> {
 	connectedHelperInfo = null;
 	helperInstanceGates.clear();
 	helperInstanceGateRevisions.clear();
-	pendingRegistry.rejectAll('E_SERVER_NOT_RUNNING', 'ScriptSync server stopped.');
 	if (scriptSyncStatusBarItem) scriptSyncStatusBarItem.tooltip = undefined;
 	releaseOwnerLease();
 }
@@ -3184,8 +3185,8 @@ function requestScopeArtifacts(includeEmpty = false, scriptObj = null, showWarni
 	requestJson.filePath = scopePath + 'scope.json';
 	requestJson.scopeName = scriptObj.scopeName;
 	requestJson.tableName = 'sys_metadata';
-	requestJson.queryString = 'sysparm_fields=sys_class_name,sys_name,sys_id,sys_updated_on&sysparm_query=sys_scope='+ scriptObj.scope +'^sys_class_name!=sys_metadata_delete^sys_update_name!=NULL^ORDERBYDESCsys_class_name';
-	requestRecords(requestJson);
+	requestJson.queryString = 'sysparm_fields=sys_class_name,sys_name,sys_id,sys_updated_on&sysparm_query=sys_scope='+ scriptObj.scope +'^sys_class_name!=sys_metadata_delete^sys_update_name!=NULL^ORDERBYDESCsys_class_name^ORDERBYsys_id';
+	scopeMetadataLoader.start(requestJson);
 
 }
 
@@ -3730,7 +3731,7 @@ function requestRecords(requestJson) {
 	if (!serverRunning) return;
 
 	try {
-		if (!wss.clients.size) {
+		if (!helperConnection.connected) {
 			vscode.window.showErrorMessage("No WebSocket connection. Please open SN Utils helper tab in a browser via slashcommand /token");
 		}
 		broadcastToHelperTab(requestJson);
@@ -3745,13 +3746,7 @@ function broadcastToHelperTab(messageObj: any) {
 		messageObj.appName = vscode.env.appName || 'VS Code';
 	}
 	const message = JSON.stringify(messageObj);
-	if (wss) {
-		wss.clients.forEach(client => {
-			if (client.readyState === WebSocket.OPEN) {
-				client.send(message);
-			}
-		});
-	}
+	helperConnection.send(message);
 }
 
 function saveFieldsToServiceNow(documentOrPath: TextDocument | string, fromVsCode:boolean): boolean {
@@ -3848,7 +3843,7 @@ function saveFieldsToServiceNow(documentOrPath: TextDocument | string, fromVsCod
 			scriptObj.action = "updateVar";
 		}
 
-		if (!wss || !wss.clients.size) {
+		if (!helperConnection.connected) {
 			vscode.window.showErrorMessage("No WebSocket connection. Please open SN Utils helper tab in a browser via slashcommand /token");
 			auditLog('sync_dispatch_blocked', { reason: 'no_websocket_client', filePath, tableName: scriptObj.tableName, sys_id: scriptObj.sys_id }, runId);
 			success = false;
@@ -4043,7 +4038,7 @@ function saveFieldAsFile(postedJson, retry = 0) {
 		// field on the Scheduled Job form). Before dropping the record into the
 		// catch-all "no_scope" folder, ask the instance for its real sys_scope
 		// and retry once with the resolved value.
-		if (!postedJson.scopeResolveAttempted && postedJson.sys_id && wss && wss.clients.size) {
+		if (!postedJson.scopeResolveAttempted && postedJson.sys_id && helperConnection.connected) {
 			resolveScopeThenSave(postedJson);
 			return;
 		}
@@ -4065,7 +4060,7 @@ function saveFieldAsFile(postedJson, retry = 0) {
 		// sys_scope returned nothing for that sys_id. Second chance: ask the
 		// record itself for sys_scope.scope, which still answers when the scope
 		// list is unreadable but the record is.
-		if (!postedJson.scopeResolveAttempted && postedJson.sys_id && wss && wss.clients.size) {
+		if (!postedJson.scopeResolveAttempted && postedJson.sys_id && helperConnection.connected) {
 			resolveScopeThenSave(postedJson);
 			return;
 		}
@@ -4271,7 +4266,7 @@ function sendToServiceNow(scriptObj: any) {
 		saveSource: scriptObj.saveSource
 	}, runId);
 	
-	if (!wss || !wss.clients.size) {
+	if (!helperConnection.connected) {
 		vscode.window.showErrorMessage("No WebSocket connection. Please open SN Utils helper tab in a browser via slashcommand /token");
 		auditLog('sync_dispatch_blocked', { reason: 'no_websocket_client', tableName: scriptObj.tableName, sys_id: scriptObj.sys_id }, runId);
 		return;
@@ -4287,7 +4282,7 @@ function requestTableStructure(tableName: string, instance: any) {
 		tableName: tableName,
 		instance: instance
 	};
-	if (wss && wss.clients.size > 0) {
+	if (helperConnection.connected) {
 		broadcastToHelperTab(requestJson);
 	}
 }
@@ -4342,7 +4337,7 @@ async function createNewArtifact(scriptObj: any) {
 		return;
 	}
 
-	if (!wss || wss.clients.size === 0) {
+	if (!helperConnection.connected) {
 		vscode.window.showErrorMessage("No WebSocket connection. Cannot create new artifact.");
 		auditLog('create_blocked', { reason: 'no_websocket_client', tableName: scriptObj?.tableName, name: scriptObj?.name }, runId);
 		return;
@@ -4483,7 +4478,7 @@ async function createArtifact(artifact: any) {
 		return;
 	}
 
-	if (!wss.clients.size) {
+	if (!helperConnection.connected) {
 		vscode.window.showErrorMessage("No WebSocket connection. Please open SN Utils helper tab in a browser via slashcommand /token");
 		return;
 	}
@@ -4555,7 +4550,7 @@ async function bgScriptExecute(showWarning = true) {
 		vscode.window.showInformationMessage("Only files in /background directory can be executed")
 		return;
 	}
-	if (wss.clients.size == 0) {
+	if (!helperConnection.connected) {
 		vscode.window.showInformationMessage("No WebSocket connection. Please open SN Utils helper tab in a browser via slashcommand /token");
 		return;
 	}
@@ -4626,7 +4621,7 @@ async function takeScreenshot(url?: string) {
 		return;
 	}
 	
-	if (!wss || !wss.clients.size) {
+	if (!helperConnection.connected) {
 		vscode.window.showErrorMessage("No WebSocket connection. Please open SN Utils helper tab in a browser via slashcommand /token");
 		return;
 	}

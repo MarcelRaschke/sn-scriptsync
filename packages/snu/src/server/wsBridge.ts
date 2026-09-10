@@ -1,4 +1,5 @@
 import * as crypto from 'crypto';
+import { HelperConnection } from './helperConnection.js';
 import { WebSocketServer, WebSocket } from 'ws';
 import { defaultPendingRegistry, PendingRegistry } from './pendingRegistry.js';
 import { resolveGateMode } from './policy.js';
@@ -35,7 +36,8 @@ export interface ActiveReview {
 
 export class StandaloneWsBridge {
   private wss?: WebSocketServer;
-  private activeClient?: WebSocket;
+  private helperConnection: HelperConnection<WebSocket>;
+  private get activeClient(): WebSocket | undefined { return this.helperConnection.current; }
   private state: HelperState = {
     tier: 'free',
     proFeatures: false,
@@ -53,8 +55,14 @@ export class StandaloneWsBridge {
 
   constructor(
     private port = 1978,
-    private pending: PendingRegistry = defaultPendingRegistry
-  ) {}
+    private pending: PendingRegistry = defaultPendingRegistry,
+    heartbeatMs = 30_000,
+  ) {
+    this.helperConnection = new HelperConnection<WebSocket>(() => {
+      this.resetHelperState();
+      this.pending.rejectAll('E_BROWSER_DISCONNECTED', 'Browser helper disconnected');
+    }, heartbeatMs);
+  }
 
   async start(): Promise<number> {
     return new Promise((resolve, reject) => {
@@ -72,12 +80,7 @@ export class StandaloneWsBridge {
         });
 
         wss.on('connection', (ws) => {
-          if (this.activeClient && this.activeClient !== ws) {
-            try {
-              this.activeClient.close(1000, 'Replaced by new connection');
-            } catch {}
-          }
-          this.activeClient = ws;
+          this.helperConnection.accept(ws);
           this.state.sessionEpoch = crypto.randomUUID();
 
           // Send host hello
@@ -103,14 +106,6 @@ export class StandaloneWsBridge {
               this.handleMessage(ws, msg);
             } catch {
               // Ignore malformed frames
-            }
-          });
-
-          ws.on('close', () => {
-            if (this.activeClient === ws) {
-              this.activeClient = undefined;
-              this.resetHelperState();
-              this.pending.rejectAll('E_BROWSER_DISCONNECTED', 'Browser helper disconnected');
             }
           });
         });
@@ -389,12 +384,7 @@ export class StandaloneWsBridge {
   async close(): Promise<void> {
     this.resetHelperState();
     this.pending.rejectAll('E_SERVER_STOPPED', 'ScriptSync server stopped');
-    if (this.activeClient) {
-      try {
-        this.activeClient.close();
-      } catch {}
-      this.activeClient = undefined;
-    }
+    this.helperConnection.stop();
     if (this.wss) {
       return new Promise((resolve) => {
         this.wss!.close(() => {
